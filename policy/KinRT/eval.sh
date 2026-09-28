@@ -1,21 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
-# Keep the parent evaluation process aligned with the policy server defaults.
 export XLA_PYTHON_CLIENT_PREALLOCATE="${XLA_PYTHON_CLIENT_PREALLOCATE:-false}"
 export XLA_PYTHON_CLIENT_MEM_FRACTION="${XLA_PYTHON_CLIENT_MEM_FRACTION:-0.8}"
-
-if ! command -v conda >/dev/null 2>&1; then
-  for conda_candidate in \
-    "${CONDA_EXE:-}" \
-    /opt/conda/bin/conda \
-    "${HOME}/miniconda3/bin/conda" \
-    "${HOME}/anaconda3/bin/conda"; do
-    if [[ -n "${conda_candidate}" && -x "${conda_candidate}" ]]; then
-      export PATH="$(dirname "${conda_candidate}"):${PATH}"
-      break
-    fi
-  done
-fi
 
 if [[ $# -lt 10 ]]; then
   echo "Usage: $0 <bench_name> <task_name> <ckpt_name> <env_cfg_type> <action_type> <seed> <policy_gpu_id> <env_gpu_id> <policy_uv_env> <eval_env_conda_env>" >&2
@@ -48,7 +34,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "[MAIN] start KinRT server, port=${policy_server_port}"
+echo "[MAIN] start server, policy_server_port=${policy_server_port}"
 setsid bash "${SCRIPT_DIR}/setup_eval_policy_server.sh" \
   "${bench_name}" "${task_name}" "${ckpt_name}" "${env_cfg_type}" "${action_type}" \
   "${seed}" "${policy_gpu_id}" "${policy_uv_env}" "${policy_server_port}" "${policy_server_ip}" &

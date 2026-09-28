@@ -1,32 +1,39 @@
-"""Reload a KinRT checkpoint and run one offline RoboDojo inference."""
+"""Reload a KinRT checkpoint and run one offline inference on an XPolicyLab observation."""
 
 from __future__ import annotations
 
 import argparse
-import importlib.machinery
 import json
 from pathlib import Path
-import sys
 import time
-import types
 
 import numpy as np
-# The offline check does not use XPolicyLab's image codecs. Providing the module
-# placeholder keeps its state-packing utilities usable on headless OpenPI nodes.
-cv2_placeholder = types.ModuleType("cv2")
-cv2_placeholder.__spec__ = importlib.machinery.ModuleSpec("cv2", loader=None)
-sys.modules["cv2"] = cv2_placeholder
 
 from XPolicyLab.policy.KinRT.model import Model
-
-
-CAMERA_NAMES = ("cam_high", "cam_left_wrist", "cam_right_wrist")
 
 
 def _to_numpy(value) -> np.ndarray:
     if hasattr(value, "detach"):
         value = value.detach().cpu().numpy()
     return np.asarray(value)
+
+
+def _synthetic_observation() -> dict:
+    blank = np.zeros((480, 640, 3), dtype=np.uint8)
+    return {
+        "vision": {
+            "cam_head": {"color": blank},
+            "cam_left_wrist": {"color": blank.copy()},
+            "cam_right_wrist": {"color": blank.copy()},
+        },
+        "state": {
+            "left_arm_joint_state": np.zeros(6, dtype=np.float32),
+            "left_ee_joint_state": np.zeros(1, dtype=np.float32),
+            "right_arm_joint_state": np.zeros(6, dtype=np.float32),
+            "right_ee_joint_state": np.zeros(1, dtype=np.float32),
+        },
+        "instruction": "stack the bowls",
+    }
 
 
 def parse_args() -> argparse.Namespace:
@@ -45,14 +52,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     if args.dataset_root is None:
-        observation = {
-            "images": {
-                camera: np.zeros((3, 480, 640), dtype=np.uint8)
-                for camera in CAMERA_NAMES
-            },
-            "state": np.zeros(14, dtype=np.float32),
-            "instruction": "stack the bowls",
-        }
+        observation = _synthetic_observation()
         input_source = "synthetic"
     else:
         try:
@@ -62,14 +62,24 @@ def main() -> None:
                 raise
             from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
 
-        dataset = LeRobotDataset(args.repo_id, root=args.dataset_root)
-        sample = dataset[args.sample_index]
+        sample = LeRobotDataset(args.repo_id, root=args.dataset_root)[args.sample_index]
+        state = _to_numpy(sample["observation.state"]).astype(np.float32).reshape(-1)
         observation = {
-            "images": {
-                camera: _to_numpy(sample[f"observation.images.{camera}"])
-                for camera in CAMERA_NAMES
+            "vision": {
+                "cam_head": {"color": np.transpose(_to_numpy(sample["observation.images.cam_high"]), (1, 2, 0))},
+                "cam_left_wrist": {
+                    "color": np.transpose(_to_numpy(sample["observation.images.cam_left_wrist"]), (1, 2, 0))
+                },
+                "cam_right_wrist": {
+                    "color": np.transpose(_to_numpy(sample["observation.images.cam_right_wrist"]), (1, 2, 0))
+                },
             },
-            "state": _to_numpy(sample["observation.state"]),
+            "state": {
+                "left_arm_joint_state": state[:6],
+                "left_ee_joint_state": state[6:7],
+                "right_arm_joint_state": state[7:13],
+                "right_ee_joint_state": state[13:14],
+            },
             "instruction": sample["task"],
         }
         input_source = str(args.dataset_root)
@@ -100,7 +110,6 @@ def main() -> None:
     actions = np.stack(
         [np.concatenate([np.asarray(action[key]) for key in action_keys]) for action in structured_actions]
     )
-
     expected_shape = (args.action_chunk_size, 14)
     if actions.shape != expected_shape:
         raise RuntimeError(f"Expected action shape {expected_shape}, got {actions.shape}.")
@@ -118,15 +127,7 @@ def main() -> None:
                 "sample_index": args.sample_index,
                 "instruction": observation["instruction"],
                 "input_source": input_source,
-                "state_shape": list(observation["state"].shape),
-                "image_shapes": {
-                    camera: list(observation["images"][camera].shape)
-                    for camera in CAMERA_NAMES
-                },
                 "action_shape": list(actions.shape),
-                "action_min": float(actions.min()),
-                "action_max": float(actions.max()),
-                "action_mean": float(actions.mean()),
                 "model_load_seconds": model_load_seconds,
                 "inference_seconds": inference_seconds,
                 "actions_output": str(args.actions_output) if args.actions_output else None,

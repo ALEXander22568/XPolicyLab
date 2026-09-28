@@ -9,13 +9,10 @@ train_config_name="${1:-${OPENPI_TRAIN_CONFIG_NAME:-kinrt_full_robodojo}}"
 repo_id="${KINRT_ROBODOJO_REPO_ID:-RoboDojo_lerobot_v30_video}"
 norm_stats_path="${OPENPI_ROOT}/assets/${train_config_name}/${repo_id}/norm_stats.json"
 
-case "${train_config_name}" in
-  kinrt_lora_robodojo|kinrt_full_robodojo) ;;
-  *)
-    echo "[KinRT][ERROR] Config must be kinrt_lora_robodojo or kinrt_full_robodojo." >&2
-    exit 1
-    ;;
-esac
+if [[ "${train_config_name}" != "kinrt_full_robodojo" ]]; then
+  echo "[KinRT][ERROR] Config must be kinrt_full_robodojo." >&2
+  exit 1
+fi
 if [[ ! -x "${PYTHON_BIN}" ]]; then
   echo "[KinRT][ERROR] Policy environment not found. Run: bash ${POLICY_DIR}/install.sh" >&2
   exit 1

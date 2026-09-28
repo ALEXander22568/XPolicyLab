@@ -34,22 +34,15 @@ fi
 router_labels_path="${KINRT_ROBODOJO_ROUTER_LABELS_PATH:-${dataset_root}/meta/${router_labels_subdir}/router_labels.npy}"
 norm_stats_path="${OPENPI_ROOT}/assets/${train_config_name}/${repo_id}/norm_stats.json"
 
-requires_router_labels=1
-case "${train_config_name}" in
-  pi05_lora_robodojo)
-    requires_router_labels=0
-    ;;
-  kinrt_lora_robodojo|kinrt_full_robodojo) ;;
-  *)
-    echo "[KinRT][ERROR] Unsupported OPENPI_TRAIN_CONFIG_NAME: ${train_config_name}" >&2
-    exit 1
-    ;;
-esac
+if [[ "${train_config_name}" != "kinrt_full_robodojo" ]]; then
+  echo "[KinRT][ERROR] Unsupported OPENPI_TRAIN_CONFIG_NAME: ${train_config_name}" >&2
+  exit 1
+fi
 if [[ ! -x "${PYTHON_BIN}" ]]; then
   echo "[KinRT][ERROR] Policy environment not found. Run: bash ${POLICY_DIR}/install.sh" >&2
   exit 1
 fi
-if (( requires_router_labels == 1 )) && [[ ! -f "${router_labels_path}" ]]; then
+if [[ ! -f "${router_labels_path}" ]]; then
   echo "[KinRT][ERROR] Router labels not found: ${router_labels_path}" >&2
   echo "[KinRT][ERROR] Install the published Full35 assets for the original dataset, or generate labels for a separately named custom dataset." >&2
   exit 1
@@ -59,7 +52,7 @@ if [[ ! -f "${norm_stats_path}" ]]; then
   echo "[KinRT][ERROR] Install the published Full35 assets, or run compute_norm_stats.sh for a custom dataset." >&2
   exit 1
 fi
-if (( requires_router_labels == 1 )) && [[ "${repo_id}" == "RoboDojo_lerobot_v30_video" ]]; then
+if [[ "${repo_id}" == "RoboDojo_lerobot_v30_video" ]]; then
   "${PYTHON_BIN}" "${POLICY_DIR}/full35_assets.py" validate-training \
     --dataset-root "${dataset_root}" \
     --labels "${router_labels_path}" \
@@ -91,9 +84,7 @@ export HF_LEROBOT_HOME="${hf_lerobot_home}"
 export HF_DATASETS_CACHE="${local_cache_root}/hf/datasets"
 export JAX_COMPILATION_CACHE_DIR="${local_cache_root}/jax"
 export KINRT_ROBODOJO_REPO_ID="${repo_id}"
-if (( requires_router_labels == 1 )); then
-  export KINRT_ROBODOJO_ROUTER_LABELS_PATH="${router_labels_path}"
-fi
+export KINRT_ROBODOJO_ROUTER_LABELS_PATH="${router_labels_path}"
 
 run_mode=(--overwrite)
 if [[ "${KINRT_RESUME:-0}" == "1" ]]; then
