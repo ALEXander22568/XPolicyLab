@@ -1,8 +1,8 @@
-# PatchWAM
+# PatchWAM-Lite
 
 **Contributor:** QZWang / PatchWAM Team | **Paper:** *An Action Is Worth One Patch: Unified World--Action Modeling with PatchWAM* (technical report forthcoming) | **arXiv:** Not yet public | **Original code:** included under `PatchWAM/`
 
-PatchWAM represents an action chunk as latent patches and denoises image and action patches in one FLUX.2 stream. This adapter releases the training and inference code for the RoboTwin 2.0 clean-to-randomized (C2R) checkpoint at step 140,000. The run initializes from FLUX.2 Klein base 4B; it does not use an Action-as-Patch pretrained checkpoint.
+PatchWAM-Lite represents an action chunk as latent patches and denoises image and action patches in one FLUX.2 stream. This adapter releases the training and inference code for the RoboTwin 2.0 clean-to-randomized (C2R) checkpoint at step 140,000. The run initializes from FLUX.2 Klein base 4B; it does not use an Action-as-Patch pretrained checkpoint.
 
 Shared conventions — argument meanings, checkpoint naming, split-machine deployment, and `EVAL_ENV_TYPE` — are documented in the [XPolicyLab README](../../README.md). Official results: [RoboTwin 2.0 Leaderboard](https://robotwin-platform.github.io/leaderboard/).
 
@@ -52,7 +52,7 @@ bash train.sh RoboTwin C2R arx_x5 joint 42 0,1,2,3,4,5,6,7
 
 ## Evaluation
 
-PatchWAM supports RoboTwin dual-arm `joint` control with `arx_x5` and `aloha_agilex` (both use 6+1 dimensions per arm). The published protocol is action horizon 16, replan 16, 10 denoising steps, unseen instructions, 50 tasks, clean and randomized conditions, and 100 episodes per task per condition.
+PatchWAM-Lite supports RoboTwin dual-arm `joint` control with `arx_x5` and `aloha_agilex` (both use 6+1 dimensions per arm). The published protocol is action horizon 16, replan 16, 10 denoising steps, unseen instructions, 50 tasks, clean and randomized conditions, and 100 episodes per task per condition.
 
 ```bash
 export PATCHWAM_FLUX2_MODEL=/path/to/flux-2-klein-base-4b.safetensors
