@@ -481,6 +481,7 @@ python scripts/transform_lerobot_v21_format.py "<bench_name>.*.*" \
 - **All three camera keys always exist.** A camera missing from the source is filled with black frames, so features stay stable across robots.
 - **Images are RGB**, decoded through `decode_image_bit` and never swapped afterwards ([above](#decode-only-through-decode_image_bit)).
 - **Joint-space bimanual only.** Both read the `*_arm_joint_states` / `*_ee_joint_states` keys and fail on a trajectory that carries only pose or single-arm keys.
+- **Video is AV1 by default.** `DatasetConfig.vcodec` picks the encoder: `libsvtav1` for AV1, `h264_nvenc` for H.264.
 - The two differ beyond dataset version only in encoding throughput: v3.0 writes images from 8 worker processes and streams video at CRF 18.
 
 </details>
