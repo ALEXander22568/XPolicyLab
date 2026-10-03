@@ -484,6 +484,7 @@ python scripts/transform_lerobot_v21_format.py "<bench_name>.*.*" \
 - **三个相机键始终存在。** 源数据缺失的相机会用黑帧填充，使特征跨机器人稳定。
 - **图像为 RGB**，经 `decode_image_bit` 解码后不再交换通道（见[上文](#图像解码只能走-decode_image_bit)）。
 - **仅支持关节空间双臂。** 二者读取 `*_arm_joint_states` / `*_ee_joint_states`，对仅含位姿或单臂键的轨迹会失败。
+- **视频默认为 AV1。** `DatasetConfig.vcodec` 选择编码器：`libsvtav1` 为 AV1，`h264_nvenc` 为 H.264。
 - 两个版本除数据集版本外，只在编码吞吐上不同：v3.0 用 8 个 worker 写图，并以 CRF 18 流式写视频。
 
 </details>
