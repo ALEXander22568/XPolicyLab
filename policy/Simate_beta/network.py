@@ -1,4 +1,4 @@
-"""SIPAI memory policy forward pass, with no training framework dependencies."""
+"""Simate_beta memory policy forward pass, with no training framework dependencies."""
 
 import math
 
@@ -92,7 +92,7 @@ class ActionHead(nn.Module):
         return actions
 
 
-class SIPAINetwork(nn.Module):
+class SimateBetaNetwork(nn.Module):
     def __init__(self, history_grid_size=4, history_compressor_hidden_dim=512):
         super().__init__()
         self.backbone = Prefix(history_grid_size, history_compressor_hidden_dim)

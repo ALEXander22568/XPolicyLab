@@ -3,13 +3,13 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 XPL_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-POLICY_ENV="${1-sipai-eval}"
+POLICY_ENV="${1-simate-beta-eval}"
 
 if [[ "${POLICY_ENV}" == "-h" || "${POLICY_ENV}" == "--help" ]]; then
     echo "Usage: bash install.sh [conda_env_name_or_prefix]"
-    echo "Create or reuse a Python 3.11 environment (default: sipai-eval)."
+    echo "Create or reuse a Python 3.11 environment (default: simate-beta-eval)."
     echo "Reuse installed CUDA PyTorch 2.6-2.8; otherwise install 2.7.0 CUDA 12.8."
-    echo "Install SIPAI inference dependencies and XPolicyLab."
+    echo "Install Simate_beta inference dependencies and XPolicyLab."
     echo "Requires Conda and a compatible NVIDIA driver; RoboDojo simulator is separate."
     exit 0
 fi
@@ -37,8 +37,8 @@ fi
 python - <<'PY'
 import sys
 if sys.version_info[:2] != (3, 11):
-    raise SystemExit("SIPAI requires Python 3.11; select a new environment name or path.")
-print(f"[SIPAI] Installing into {sys.prefix}", flush=True)
+    raise SystemExit("Simate_beta requires Python 3.11; select a new environment name or path.")
+print(f"[Simate_beta] Installing into {sys.prefix}", flush=True)
 PY
 
 # Reuse installed packages and pip's configured cache; do not force upgrades.
@@ -48,7 +48,7 @@ import importlib.util
 raise SystemExit(0 if importlib.util.find_spec("torch") is not None else 1)
 PY
 then
-    echo "[SIPAI] Reusing installed PyTorch."
+    echo "[Simate_beta] Reusing installed PyTorch."
 else
     python -m pip install 'torch==2.7.0+cu128' --index-url https://download.pytorch.org/whl/cu128
 fi
@@ -64,13 +64,13 @@ python -m pip check
 
 PYTHONPATH="${XPL_ROOT}:${XPL_ROOT}/..${PYTHONPATH:+:${PYTHONPATH}}" python - <<'PY'
 import torch
-from XPolicyLab.policy.SIPAI.model import Model
+from XPolicyLab.policy.Simate_beta.model import Model
 from XPolicyLab.client_server.ws.model_server import PolicyServer
 
 torch_series = tuple(int(part) for part in torch.__version__.split(".")[:2])
 if torch_series not in {(2, 6), (2, 7), (2, 8)} or torch.version.cuda is None:
     raise SystemExit("Use a CUDA build of PyTorch 2.6, 2.7 or 2.8 in the selected environment.")
-print(f"[SIPAI] PyTorch {torch.__version__}; CUDA {torch.version.cuda}")
-print("[SIPAI] Model and WebSocket server imports passed.")
+print(f"[Simate_beta] PyTorch {torch.__version__}; CUDA {torch.version.cuda}")
+print("[Simate_beta] Model and WebSocket server imports passed.")
 PY
-echo "[SIPAI] Installation complete. Activate with: conda activate ${POLICY_ENV}"
+echo "[Simate_beta] Installation complete. Activate with: conda activate ${POLICY_ENV}"

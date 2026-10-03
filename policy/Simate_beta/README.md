@@ -1,9 +1,9 @@
-# SIPAI
+# Simate_beta
 
 **Contributor:** SIPAILab | **Paper:** Not provided | **arXiv:** Not provided | **Original code:** Inference implementation in this directory
 
-Self-contained, **eval-only** SIPAI AE memory policy for XPolicyLab. This directory
-contains the inference implementation; no separate SIPAI repository or runtime
+Self-contained, **eval-only** Simate_beta AE memory policy for XPolicyLab. This directory
+contains the inference implementation; no separate Simate_beta repository or runtime
 is required. Dependencies are PyTorch, standard public Python packages and the
 shared XPolicyLab server/client utilities.
 
@@ -16,7 +16,7 @@ run from this directory:
 
 ```bash
 bash install.sh
-conda activate sipai-eval
+conda activate simate-beta-eval
 ```
 
 The script creates a Python 3.11 environment when needed, reuses installed CUDA
@@ -37,8 +37,8 @@ offline wheel directory.
 To choose an environment name or path:
 
 ```bash
-bash install.sh my-sipai-env
-# Or: bash install.sh /path/to/sipai-env
+bash install.sh my-simate-beta-env
+# Or: bash install.sh /path/to/simate-beta-env
 ```
 
 Use that same name/path as the policy environment argument to `eval.sh`.
@@ -67,8 +67,8 @@ bash eval.sh <bench_name> <task_name> <ckpt_name> <env_cfg_type> <action_type> <
 ```
 
 ```bash
-EVAL_ENV_TYPE=debug bash eval.sh RoboDojo stack_bowls sipai-robodojo-eval arx_x5 joint 0 0 1 sipai-eval RoboDojo
-EVAL_ENV_TYPE=sim bash eval.sh RoboDojo stack_bowls sipai-robodojo-eval arx_x5 joint 0 0 1 sipai-eval RoboDojo
+EVAL_ENV_TYPE=debug bash eval.sh RoboDojo stack_bowls simate-beta-robodojo-eval arx_x5 joint 0 0 1 simate-beta-eval RoboDojo
+EVAL_ENV_TYPE=sim bash eval.sh RoboDojo stack_bowls simate-beta-robodojo-eval arx_x5 joint 0 0 1 simate-beta-eval RoboDojo
 ```
 
 The ten positional arguments follow the standard XPolicyLab convention. For
@@ -105,8 +105,8 @@ bash download_checkpoint.sh
 bash download_checkpoint.sh /path/to/checkpoint
 ```
 
-The default destination is `checkpoints/sipai-robodojo-eval` under this adapter,
-independent of the working directory. Pass `sipai-robodojo-eval` as `ckpt_name`
+The default destination is `checkpoints/simate-beta-robodojo-eval` under this adapter,
+independent of the working directory. Pass `simate-beta-robodojo-eval` as `ckpt_name`
 to `eval.sh` for that default, or pass the absolute path of a custom destination.
 The local directory name is independent of the Hugging Face repository name.
 Checkpoint lookup uses XPolicyLab's shared resolver.
@@ -123,14 +123,14 @@ an existing file. Cache files are copied into the destination, so reserve space
 for both copies when the cache is on the same disk. Checking for updates requires
 network access.
 
-The script fetches only `model.safetensors` from the SIPAI repository and
+The script fetches only `model.safetensors` from the Simate_beta Hugging Face repository and
 `tokenizer.model` from
 [Google's official PaliGemma repository](https://huggingface.co/google/paligemma-3b-pt-224).
 A compatible existing tokenizer is reused, with its checksum verified.
 For an uncached tokenizer, first accept the Google repository's access terms
 and authenticate with `hf auth login` or `HF_TOKEN`.
 
-The public SIPAI weights can be downloaded without logging in. Access to a
+The public Simate_beta weights can be downloaded without logging in. Access to a
 private repository requires authentication with read access.
 Standard proxy and Hugging Face cache settings are honored; credentials are
 not stored in this script. No PaliGemma weights or extra inference JSON files
@@ -144,7 +144,7 @@ XPolicyLab fields:
 ```yaml
 device: cuda:0
 exec_chunk_size: 10
-architecture: sipai_memory_ae_joint_v1
+architecture: simate_beta_memory_ae_joint_v1
 dtype: float32
 history_frames: 25
 history_interval: 20

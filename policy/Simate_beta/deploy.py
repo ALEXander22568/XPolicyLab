@@ -18,7 +18,7 @@ def eval_one_episode(TASK_ENV, model_client):
             model_client.call(func_name="update_obs", obs=obs)
             actions = model_client.call(func_name="get_action", obs=scope)
             if not actions:
-                raise RuntimeError("SIPAI returned an empty action chunk")
+                raise RuntimeError("Simate_beta returned an empty action chunk")
             for step, action in enumerate(actions):
                 TASK_ENV.take_action(action)
                 if TASK_ENV.is_episode_end() or step + 1 == len(actions):
@@ -47,10 +47,10 @@ def eval_one_episode_batch(TASK_ENV, model_client):
             model_client.call(func_name="update_obs_batch", obs=_batch_obs(TASK_ENV, indices, scope))
             actions = model_client.call(func_name="get_action_batch", obs={**scope, "env_idx_list": indices})
             if len(actions) != len(indices) or not actions or not actions[0]:
-                raise RuntimeError("Invalid SIPAI action batch")
+                raise RuntimeError("Invalid Simate_beta action batch")
             chunk_size = len(actions[0])
             if any(len(chunk) != chunk_size for chunk in actions):
-                raise RuntimeError("SIPAI returned unequal chunk lengths")
+                raise RuntimeError("Simate_beta returned unequal chunk lengths")
             for step in range(chunk_size):
                 TASK_ENV.take_action_batch([chunk[step] for chunk in actions], indices)
                 if TASK_ENV.is_episode_end() or step + 1 == chunk_size:

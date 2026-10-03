@@ -3,7 +3,7 @@ set -euo pipefail
 
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
     echo "Usage: bash download_checkpoint.sh [destination]"
-    echo "Default: checkpoints/sipai-robodojo-eval under this script's directory."
+    echo "Default: checkpoints/simate-beta-robodojo-eval under this script's directory."
     exit 0
 fi
 if (( $# > 1 )); then
@@ -11,7 +11,7 @@ if (( $# > 1 )); then
     exit 2
 fi
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-DESTINATION="${1:-${SCRIPT_DIR}/checkpoints/sipai-robodojo-eval}"
+DESTINATION="${1:-${SCRIPT_DIR}/checkpoints/simate-beta-robodojo-eval}"
 
 python - "${DESTINATION}" <<'PY'
 import hashlib
@@ -74,7 +74,7 @@ def fetch(repo, name, destination, expected=None, validate=None):
 
 
 destination = Path(sys.argv[1]).expanduser().resolve()
-print(f"Downloading current SIPAI checkpoint from {REPO_ID}", flush=True)
+print(f"Downloading current Simate_beta checkpoint from {REPO_ID}", flush=True)
 try:
     # Resolve tokenizer access before downloading the much larger model file.
     fetch(TOKENIZER_REPO, "tokenizer.model", destination, TOKENIZER_SHA256)

@@ -1,4 +1,4 @@
-"""Standalone, eval-only SIPAI adapter for XPolicyLab."""
+"""Standalone, eval-only Simate_beta adapter for XPolicyLab."""
 
 from pathlib import Path
 import random
@@ -14,7 +14,7 @@ from XPolicyLab.utils.checkpoint_resolver import resolve_checkpoint_root
 from XPolicyLab.utils.process_data import get_robot_action_dim_info
 
 from .history import CameraHistory
-from .network import SIPAINetwork
+from .network import SimateBetaNetwork
 from .processing import CAMERAS, action_dict, camera_image, decode_actions, prepare
 
 POLICY_DIR = Path(__file__).resolve().parent
@@ -24,7 +24,7 @@ class Model(ModelTemplate):
     def __init__(self, model_cfg):
         self.model_cfg = dict(model_cfg)
         if model_cfg.get("action_type") != "joint":
-            raise ValueError("SIPAI requires action_type=joint")
+            raise ValueError("Simate_beta requires action_type=joint")
         dims = get_robot_action_dim_info(model_cfg["env_cfg_type"])
         if list(dims["arm_dim"]) != [6, 6] or list(dims["ee_dim"]) != [1, 1]:
             raise ValueError("Checkpoint requires two six-joint arms and scalar grippers")
@@ -36,8 +36,8 @@ class Model(ModelTemplate):
             explicit_keys=("checkpoint_path",),
         )
         cfg = self.model_cfg
-        if cfg["architecture"] != "sipai_memory_ae_joint_v1" or cfg["dtype"] != "float32":
-            raise ValueError("Unsupported SIPAI deployment architecture or precision")
+        if cfg["architecture"] != "simate_beta_memory_ae_joint_v1" or cfg["dtype"] != "float32":
+            raise ValueError("Unsupported Simate_beta deployment architecture or precision")
         self.device = torch.device(model_cfg.get("device", "cuda:0"))
         self.exec_chunk_size = int(model_cfg.get("exec_chunk_size", 10))
         if not 1 <= self.exec_chunk_size <= 50:
@@ -49,7 +49,7 @@ class Model(ModelTemplate):
         self.history = CameraHistory(cfg["history_frames"], cfg["history_interval"])
         self.tokenizer = sentencepiece.SentencePieceProcessor(model_file=str(root / "tokenizer.model"))
         with torch.device("meta"):
-            self.network = SIPAINetwork(cfg["history_grid_size"], cfg["history_compressor_hidden_dim"])
+            self.network = SimateBetaNetwork(cfg["history_grid_size"], cfg["history_compressor_hidden_dim"])
         with safe_open(str(root / "model.safetensors"), framework="pt", device="cpu") as handle:
             if not any(key.startswith("backbone.history_compressor.") for key in handle.keys()):
                 raise ValueError("This adapter requires AE policy weights; pooling checkpoints are incompatible")
@@ -64,7 +64,7 @@ class Model(ModelTemplate):
         torch.manual_seed(seed)
         self.observations, self.latest = {}, {}
         print(
-            f"[SIPAI] standalone; history={cfg['history_frames']}"
+            f"[Simate_beta] standalone; history={cfg['history_frames']}"
             f"x{cfg['history_interval']} steps; "
             f"exec={self.exec_chunk_size}; AE history encoder; fp32; gripper compensation=0",
             flush=True,
@@ -111,7 +111,7 @@ class Model(ModelTemplate):
         )
         normalized = self.network(prepared, steps=self.steps)[0].cpu().numpy()
         if not np.isfinite(normalized).all():
-            raise FloatingPointError("SIPAI produced non-finite actions")
+            raise FloatingPointError("Simate_beta produced non-finite actions")
         actions = decode_actions(normalized, state)
         return [action_dict(row, self.robot_action_dim_info) for row in actions[: self.exec_chunk_size]]
 
