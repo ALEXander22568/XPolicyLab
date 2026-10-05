@@ -14,6 +14,9 @@
 <a href="https://robotwin-platform.github.io/leaderboard">RoboTwin Leaderboard</a>
 </p>
 
+<p>🏆 <strong>Best Tool Paper Award</strong> · IROS 2026, Pittsburgh<br/>
+Building Scalable Infrastructure for Robot Learning Workshop, awarded to all XPolicyLab contributors.</p>
+
 <img src="assets/teaser.png" alt="XPolicyLab overview" width="100%"/>
 
 <p><em>Connecting N policies to M evaluation environments — from O(N×M) down to O(N+M).</em></p>

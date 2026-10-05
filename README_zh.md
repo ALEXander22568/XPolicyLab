@@ -14,6 +14,9 @@
 <a href="https://robotwin-platform.github.io/leaderboard">RoboTwin Leaderboard</a>
 </p>
 
+<p>🏆 <strong>最佳工具论文奖</strong> · IROS 2026, Pittsburgh<br/>
+Building Scalable Infrastructure for Robot Learning Workshop，授予全体 XPolicyLab 贡献者。</p>
+
 <img src="assets/teaser.png" alt="XPolicyLab overview" width="100%"/>
 
 <p><em>把 N 个策略接到 M 个评测环境 —— 从 O(N×M) 降到 O(N+M)。</em></p>
