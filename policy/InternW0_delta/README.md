@@ -1,8 +1,8 @@
 # InternW0_delta
 
-**Contributor:** Xingyu Miao | **Paper:** Not released | **arXiv:** Not released | **Original code:** evaluation-only inference closure in `wam_runtime/`
+**Contributor:** Xingyu Miao | **Paper:** InternW0-Δ | **arXiv:** [2609.31394](https://arxiv.org/abs/2609.31394) | **Original code:** [InternRobotics/InternW0-Delta](https://github.com/InternRobotics/InternW0-Delta)
 
-This adapter reproduces the RoboDojo evaluation of InternW0_delta for `env_cfg_type=arx_x5` with `action_type=joint`, using a 32-step action horizon, replanning after 10 executed actions, and 10 denoising steps. Training code and training datasets are intentionally not included; the vendored `wam_runtime/` contains only the model and online-inference modules required by this evaluation.
+This adapter reproduces the RoboDojo evaluation of InternW0_delta for `env_cfg_type=arx_x5` with `action_type=joint`, using a 32-step action horizon, replanning after 10 executed actions, and 10 denoising steps. Evaluation still uses the lightweight vendored `wam_runtime/` by default; training and data processing are wired to the full official InternW0-Delta source checkout because the training stack requires `wam.datasets`, Hydra configs, Accelerate/DeepSpeed launch scripts, and post-training tools that are not part of the eval-only runtime.
 
 Shared conventions — argument meanings, checkpoint naming, split-machine deployment, `EVAL_ENV_TYPE` — are documented in the [XPolicyLab README](../../README.md). Official results: [RoboDojo LeaderBoard](https://robodojo-benchmark.com/LeaderBoard).
 
@@ -14,21 +14,102 @@ bash install.sh internw0-delta
 conda activate internw0-delta
 ```
 
+For training/data processing, clone the official source into this policy
+directory, or point `INTERNW0_DELTA_ROOT` at an external checkout before
+running `install.sh`:
+
+```bash
+cd policy/InternW0_delta
+bash sync_upstream.sh
+bash install.sh internw0-delta
+```
+
 `install.sh` also installs a local C/C++ toolchain because RynnBrain's
 FLA/Triton kernels compile a small runtime helper during their first forward
 pass. No system-wide compiler installation is required. The tested policy
 runtime is Python 3.11, PyTorch 2.10.0 with CUDA 12.8, Transformers 5.13.0,
 and BF16 inference; the install script pins these model-sensitive packages.
+When the full official source exists, `install.sh` installs it with
+`[train,modelscope]` extras; otherwise it installs only `wam_runtime/` for
+evaluation.
 
 ## Data Processing
 
-Not applicable. This is an evaluation-only submission.
+`process_data.sh` prepares the official RoboDojo post-training layout:
+
+```bash
+cd policy/InternW0_delta
+bash process_data.sh RoboDojo <task_name> arx_x5 joint [expert_data_num] [raw_task_dirs]
+```
+
+The InternW0-Delta post-training loader reads **LeRobot v2.1**
+(`meta/tasks.jsonl`, `meta/episodes.jsonl`, one parquet per episode), so the
+wrapper calls the official converter `scripts/transform_lerobot_v21_format.py`
+at 480x640 — offline decoding therefore goes through `decode_image_bit`, and
+the keys (`observation.images.{cam_high,cam_left_wrist,cam_right_wrist}`,
+`observation.state`, `action`, 14D) are the official ones that
+`configs/data/robodojo.yaml` expects. No custom converter is involved. The
+dataset is written to
+`policy/InternW0_delta/data/<bench>-<ckpt>-<env>-<action>/{meta,data,videos}`
+(override with `ROBODOJO_DATA_ROOT`); an already complete dataset there is
+reused, not regenerated.
+
+The converter imports `lerobot.datasets.lerobot_dataset` from a LeRobot
+release that still writes codebase v2.1. That package is not part of the
+`internw0-delta` environment (the upstream code vendors its own reader), so
+point `INTERNW0_CONVERT_PYTHON` at a Python that has it, e.g.
+`INTERNW0_CONVERT_PYTHON=/path/to/lerobot-env/bin/python`.
+
+Inputs are read from the parent workspace's raw-data layout,
+`data/RoboDojo/<task>/arx_x5/data/*.hdf5`. `raw_task_dirs` defaults to
+`<task_name>` and may be comma-separated to merge several task folders;
+`expert_data_num` caps the episodes per task.
+
+The wrapper then builds the official text-embedding cache
+(`tools/text_cache.py task=robodojo`) with the local Wan2.2 UMT5 encoder from
+`download_assets.sh`, writing to `.cache/internw0/text_embed/robodojo`. Set
+`INTERNW0_SKIP_TEXT_CACHE=1` to skip it, and `INTERNW0_DELTA_ROOT` if the
+official checkout is not `policy/InternW0_delta/InternW0-Delta`.
 
 ## Training
 
-Not included in this submission. This package contains the inference runtime
-and the configuration required to reproduce the reported checkpoint evaluation.
-Training code is scheduled for release before the end of October 2026.
+Post-training is launched through the official InternW0-Delta recipe:
+
+```bash
+cd policy/InternW0_delta
+bash train.sh RoboDojo <task_name> arx_x5 joint <seed> <gpu_id> [num_gpus]
+```
+
+`train.sh` writes artifacts to the XPolicyLab-standard run directory:
+
+```text
+policy/InternW0_delta/checkpoints/RoboDojo-<task_name>-arx_x5-joint-<seed>/
+  checkpoints/weights/slot_*.pt
+  checkpoints/weights/weights_manifest.json
+  checkpoints/state/latest/
+  config.yaml
+```
+
+Before training, run `download_assets.sh` and place the official
+[`InternW0-Delta-Base`](https://huggingface.co/InternRobotics/InternW0-Delta-Base)
+weights at `policy/InternW0_delta/checkpoints/pretrain.pt` (or set
+`WAM_PRETRAIN_CHECKPOINT`). The wrapper reuses the evaluation assets — Wan2.2
+VAE in its original format and RynnBrain from `assets/` — by passing
+`model.redirect_common_files=false` and the local `model_id` /
+`tokenizer_model_id`, the same settings as the official RoboDojo evaluation
+config; `DIFFSYNTH_SKIP_DOWNLOAD=true` makes a missing file fail instead of
+being downloaded elsewhere. The video DiT is not loaded from Wan2.2
+(`skip_dit_load_from_pretrain=true`); it comes from `pretrain.pt`.
+
+It auto-runs `process_data.sh` when the dataset is missing. Extra Hydra
+overrides can be appended through `INTERNW0_TRAIN_OVERRIDES`; keep model
+architecture keys unchanged, because evaluation rebuilds the model from
+`config/eval_model.yaml`:
+
+```bash
+INTERNW0_TRAIN_OVERRIDES="max_steps=1000 save_every=500" \
+  bash train.sh RoboDojo stack_bowls arx_x5 joint 0 0
+```
 
 ## Evaluation
 
@@ -41,8 +122,16 @@ bash eval.sh RoboDojo stack_bowls robodojo arx_x5 joint 0 0 0 internw0-delta <ev
 ```
 
 The checkpoint comes from `checkpoint_path` in `deploy.yml` (or
-`WAM_CHECKPOINT_PATH`), so `ckpt_name` only labels the run. For the offline
-wiring check without model weights, run
+`WAM_CHECKPOINT_PATH`) for released weights. For locally trained checkpoints,
+`setup_eval_policy_server.sh` also resolves the latest official
+`checkpoints/weights/slot_*.pt` under
+`checkpoints/<bench>-<ckpt>-<env>-<action>-<seed>/` (pass the short task
+name or the full run-directory name as `ckpt_name`), using the `latest` entry
+of `weights_manifest.json`, else the newest slot by modification time. A run
+directory without weights is an error rather than a silent fallback to
+`robodojo.pt`. Evaluation keeps `config/dataset_stats.json`, which is
+identical to the upstream `assets/stats/robodojo.json` used by training. For the offline wiring check without
+model weights, run
 `EVAL_ENV_TYPE=debug WAM_ALLOW_DUMMY_POLICY=true bash eval.sh ...` with the
 same arguments; leave `EVAL_ENV_TYPE` unset or set `EVAL_ENV_TYPE=sim` for
 RoboDojo simulation. For split-machine deployment via
@@ -131,6 +220,8 @@ recent-KV-cache mask fix.
   inference path as `eval_batch: false`; GPU inference runs one environment
   at a time. Batched observations must carry `env_idx`, as the RoboDojo and
   debug environment clients do.
+- Training/data wrappers require the public official repository checkout; the
+  eval-only vendored runtime remains intentionally small.
 - Reference result: a self-run, single-environment evaluation over 54 tasks
   and 6,300 episodes completed 1,444 successful episodes — 22.92% success rate
   and 30.35 mean score.
