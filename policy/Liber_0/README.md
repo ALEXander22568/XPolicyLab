@@ -27,7 +27,7 @@ The inference engine and backend source are bundled; no external runtime/source
 checkout or FlashAttention installation is required.
 
 ```bash
-cd XPolicyLab/policy/Liber-0
+cd XPolicyLab/policy/Liber_0
 bash install.sh /path/to/env
 export PATH=/path/to/env/bin:$PATH
 export TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=0

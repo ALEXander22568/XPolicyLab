@@ -1,4 +1,4 @@
-policy_name: Liber-0
+policy_name: Liber_0
 protocol: ws
 host: localhost
 port: null
