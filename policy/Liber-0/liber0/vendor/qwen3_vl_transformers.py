@@ -5,6 +5,7 @@
 #                          modular_qwen3_vl.py file directly. One of our CI enforces this.
 #                🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨
 # coding=utf-8
+# Whitespace normalized for distribution; executable code is unchanged.
 # Copyright 2025 The Qwen Team and The HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,7 +22,7 @@
 import os
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Union
-import math 
+import math
 
 import torch
 import torch.nn as nn
@@ -961,7 +962,7 @@ class BottleneckPatchEmbed(nn.Module):
     def forward(self, x):
         x = self.proj2(self.proj1(x))
         return x
-    
+
 class FinalLayer(nn.Module):
     def __init__(self, config, hidden_size, patch_size, out_channels):
         super().__init__()
@@ -1043,7 +1044,7 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
 
         self.t_embedder1 = TimestepEmbedder(self.config, hidden_size)
         self.x_embedder = BottleneckPatchEmbed(self.config,  patch_size = self.patch_size, in_chans = self.in_channels, pca_dim = bottleneck_dim, embed_dim = hidden_size, bias=True)
-    
+
         # self.t_embedder2 = TimestepEmbedder(self.config, hidden_size)
         self.t_embedder2 = None
         self.final_layer2 = FinalLayer(self.config, hidden_size = hidden_size, patch_size = self.patch_size, out_channels = self.in_channels)

@@ -1,5 +1,7 @@
 # Liber-0
 
+**Contributor:** LiberAI | **Paper:** Pending | **arXiv:** Pending | **Original code:** [liber0/](liber0/)
+
 RoboDojo evaluation policy for `arx_x5` with joint actions.
 
 Shared conventions — argument meanings, checkpoint naming, split-machine deployment, `EVAL_ENV_TYPE` — are documented in the [XPolicyLab README](../../README.md). Official results: [RoboDojo LeaderBoard](https://robodojo-benchmark.com/LeaderBoard).
@@ -44,7 +46,7 @@ Not required for evaluation.
 
 ## Training
 
-This adapter is evaluation-only.
+This adapter is evaluation-only. Training code will be released with the paper.
 
 ## Evaluation
 
