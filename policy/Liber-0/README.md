@@ -35,10 +35,12 @@ python download_checkpoint.py --destination ./checkpoint --assets-dir ./assets
 export LIBER0_MODEL_PATH="$PWD/assets"
 ```
 
+Checkpoint: [PixelWAM-RoboDojo](https://huggingface.co/zxw1810/PixelWAM-RoboDojo)
+(private; authorized access required).
+
 The downloader pins both repositories and verifies checkpoint checksums.
-Downloads total approximately 53 GB. The checkpoint currently requires granted
-Hugging Face access; run `hf auth login` before downloading. It does not use
-proxy environment variables.
+Downloads total approximately 53 GB. Run `hf auth login` with an authorized
+account before downloading. The downloader does not use proxy environment variables.
 
 ## Data Processing
 
