@@ -16,15 +16,21 @@ from XPolicyLab.utils.process_data import decode_obs_images, encode_image_bit, p
 class Engine:
     action_horizon = 32
     robotwin_camera_layout = "four_grid_288x384"
-    model = SimpleNamespace(stack="hidream_o1", dit=SimpleNamespace(action_dim=14), action_expert_stability_fp32=True)
+    model = SimpleNamespace(dit=SimpleNamespace(action_dim=14), action_expert_stability_fp32=True)
 
     def __init__(self):
         self.calls = []
+        self.batch_calls = []
         self.actions = np.tile(np.arange(14, dtype=np.float32), (32, 1))
 
-    def _infer_action_chunk(self, observation, instruction, request_seed):
+    def infer_action_chunk(self, observation, instruction, request_seed):
         self.calls.append((observation, instruction, request_seed))
         return self.actions.copy()
+
+    def infer_action_batch(self, observations, instructions, request_seeds):
+        self.batch_calls.append((observations, instructions, request_seeds))
+        return np.stack([self.infer_action_chunk(obs, instruction, seed)
+                         for obs, instruction, seed in zip(observations, instructions, request_seeds)])
 
 
 @pytest.fixture
@@ -126,33 +132,67 @@ def test_invalid_predictions_surface(policy, kind):
         policy.get_action()
 
 
-def test_unsupported_batch_is_explicit(policy):
-    with pytest.raises(NotImplementedError):
+def test_batch_identity_cue_seed_subset_and_reset(policy):
+    first, second = observation(10), observation(50)
+    first['env_idx'], second['env_idx'] = 7, 2
+    policy.update_obs_batch([first, second])
+    first['vision']['cam_head']['color'][:] = 99
+    assert len(policy.get_action_batch([2, 7])) == 2
+    observations, _, seeds = policy.policy.batch_calls[-1]
+    assert seeds == [0, 0]
+    assert np.all(observations[0]['visual_cue_rgb'] == 50)
+    assert np.all(observations[1]['visual_cue_rgb'] == 10)
+    second['vision']['cam_head']['color'][:] = 80
+    policy.update_obs_batch([second])
+    assert len(policy.get_action_batch()) == 1
+    assert policy.policy.batch_calls[-1][2] == [1]
+    assert policy._batch[7]['replan_index'] == 1
+    policy.reset_envs([2])
+    policy.update_obs_batch([second, first])
+    policy.get_action_batch()
+    observations, _, seeds = policy.policy.batch_calls[-1]
+    assert seeds == [0, 1]
+    assert np.all(observations[0]['visual_cue_rgb'] == 80)
+    assert np.all(observations[1]['visual_cue_rgb'] == 10)
+    policy.reset()
+    assert not policy._batch and not policy._batch_order
+
+
+def test_batch_requires_explicit_unique_ids(policy):
+    with pytest.raises(KeyError):
         policy.update_obs_batch([observation()])
-    with pytest.raises(NotImplementedError):
-        policy.get_action_batch([0])
+    obs = dict(observation(), env_idx=0)
+    with pytest.raises(ValueError, match='unique'):
+        policy.update_obs_batch([obs, obs])
+    with pytest.raises(ValueError, match='update_obs_batch'):
+        policy.get_action_batch()
+    policy.update_obs_batch([obs])
+    with pytest.raises(KeyError):
+        policy.get_action_batch([1])
 
 
-def test_loader_uses_public_namespace_and_asset_variables(monkeypatch, tmp_path):
-    runtime, assets, backend = (tmp_path / name for name in ('runtime', 'assets', 'backend'))
-    for path in (runtime, assets, backend):
-        path.mkdir()
+@pytest.mark.parametrize('kind', ['shape', 'nan'])
+def test_invalid_batch_does_not_advance_counters(policy, kind):
+    policy.update_obs_batch([dict(observation(), env_idx=2), dict(observation(20), env_idx=7)])
+    if kind == 'shape':
+        policy.policy.actions = np.zeros((31, 14), dtype=np.float32)
+    else:
+        policy.policy.actions[0, 0] = np.nan
+    with pytest.raises(ValueError, match='Invalid predicted batch'):
+        policy.get_action_batch()
+    assert all(state['replan_index'] == 0 for state in policy._batch.values())
+
+
+def test_loader_uses_bundled_runtime(monkeypatch, tmp_path):
+    assets = tmp_path / 'assets'
+    assets.mkdir()
     constructor = Mock(return_value=object())
-    serving = SimpleNamespace(__file__=str(runtime / 'wam/model/pixelwam/serving.py'), Policy=constructor)
-    imported = Mock(return_value=serving)
-    monkeypatch.setattr(adapter.importlib, 'import_module', imported)
-    monkeypatch.setattr(adapter.sys, 'path', adapter.sys.path.copy())
-    monkeypatch.setenv('PIXELWAM_MODEL_PATH', '')
-    monkeypatch.setenv('PIXELWAM_SOURCE_PATH', '')
-    config = dict(runtime_root=str(runtime), model_assets_path=str(assets),
-                  backend_source_path=str(backend), weights_file='model.pt',
+    monkeypatch.setattr(adapter, 'Policy', constructor)
+    config = dict(model_assets_path=str(assets), weights_file='model.pt',
                   device='cpu', num_inference_steps=10, seed=0)
     adapter._load_policy(config, tmp_path)
-    imported.assert_called_once_with('pixelwam.serving')
-    assert adapter.os.environ['PIXELWAM_MODEL_PATH'] == str(assets)
-    assert adapter.os.environ['PIXELWAM_SOURCE_PATH'] == str(backend)
-    assert constructor.call_args.kwargs['checkpoint_path'] == str(tmp_path / 'model.pt')
-    assert constructor.call_args.kwargs['config_path'] == str(tmp_path / 'config.yaml')
+    constructor.assert_called_once_with(checkpoint_root=tmp_path, assets=assets,
+        device='cpu', weights_file='model.pt', num_inference_steps=10)
 
 
 @pytest.mark.parametrize("encoded", [False, True])
@@ -202,3 +242,66 @@ def test_official_websocket_and_deploy_loop_with_mock_engine(policy, encoded):
     assert len(policy.policy.calls) == 2
     assert policy.replan_index == 2
     assert np.all(policy.episode_cue == 10)
+
+
+@pytest.mark.parametrize('encoded', [False, True])
+def test_official_batch_loop_handles_finished_environments(policy, encoded):
+    from client_server.ws.model_client import WsModelClient
+    from client_server.ws.model_server import PolicyServer, PolicyServerConfig
+    deploy = importlib.import_module('XPolicyLab.policy.Liber-0.deploy')
+
+    class Environment:
+        def __init__(self):
+            self.steps = {7: 0, 2: 0}
+            self.limits = {7: 5, 2: 18}
+
+        def get_running_env_idx_list(self):
+            return [key for key in self.steps if self.steps[key] < self.limits[key]]
+
+        def is_episode_end(self):
+            return not self.get_running_env_idx_list()
+
+        def get_obs_batch(self, env_ids):
+            result = []
+            for env_id in env_ids:
+                obs = dict(observation(10 * env_id + self.steps[env_id]), env_idx=env_id)
+                if encoded:
+                    for view in obs['vision'].values():
+                        view['color'] = encode_image_bit(view['color'])
+                result.append(obs)
+            return result
+
+        def take_action_batch(self, actions, env_ids):
+            assert len(actions) == len(env_ids)
+            for env_id, action in zip(env_ids, actions):
+                assert len(action) == 4
+                self.steps[env_id] += 1
+
+    async def exercise():
+        server = PolicyServer(policy, PolicyServerConfig(host='127.0.0.1', port=0))
+        await server.start()
+        port = server._server.sockets[0].getsockname()[1]
+
+        def run_client():
+            client = WsModelClient(url=f'ws://127.0.0.1:{port}', evaluation_id='mock-batch',
+                                   trial_id='episode', max_connect_attempts=1)
+            env = Environment()
+            try:
+                deploy.eval_one_episode_batch(env, client)
+                assert env.steps == env.limits
+                assert policy._batch[7]['replan_index'] == 1
+                assert policy._batch[2]['replan_index'] == 2
+                assert np.all(policy._batch[7]['cue'] == 70)
+                assert np.all(policy._batch[2]['cue'] == 20)
+                client.call(func_name='reset_envs', obs=[7])
+                assert 7 not in policy._batch and 2 in policy._batch
+            finally:
+                client.close()
+
+        try:
+            await asyncio.to_thread(run_client)
+        finally:
+            await server.stop()
+
+    asyncio.run(exercise())
+    assert [len(call[0]) for call in policy.policy.batch_calls] == [2, 1]

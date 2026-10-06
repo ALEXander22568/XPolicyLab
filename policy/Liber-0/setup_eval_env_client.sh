@@ -24,6 +24,17 @@ yaml_file="${XPL_ROOT}/policy/${policy_name}/deploy.yml"
 
 echo "[CLIENT] policy=${policy_name}, task=${task_name}, server=${policy_server_ip}:${policy_server_port}"
 
+if [[ "${EVAL_ENV_TYPE:-sim}" == "debug" ]]; then
+    client_python="${eval_env_conda_env}/bin/python"
+    [[ -x "$client_python" ]] || { echo "Debug mode requires an environment prefix as argument 8." >&2; exit 1; }
+    export PYTHONPATH="${XPL_ROOT}:${BENCH_ROOT}${PYTHONPATH:+:$PYTHONPATH}"
+    eval_batch=$("$client_python" -c 'import sys,yaml; print(str(yaml.safe_load(open(sys.argv[1]))["eval_batch"]).lower())' "$yaml_file")
+    exec "$client_python" "${UTILS_DIR}/debug_env_client.py" \
+        --bench_name "$bench_name" --task_name "$task_name" \
+        --env_cfg_type "$env_cfg_type" --policy_name "$policy_name" \
+        --protocol ws --host "$policy_server_ip" --port "$policy_server_port" --eval_batch "$eval_batch"
+fi
+
 bash "${UTILS_DIR}/setup_env_client.sh" \
     "${UTILS_DIR}" \
     "${yaml_file}" \

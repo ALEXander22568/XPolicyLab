@@ -11,9 +11,7 @@ action_type: null
 gpu_id: null
 eval_batch: false
 device: cuda
-runtime_root: null
 model_assets_path: null
-backend_source_path: null
 checkpoint_path: null
 weights_file: model.pt
 replan_steps: 16

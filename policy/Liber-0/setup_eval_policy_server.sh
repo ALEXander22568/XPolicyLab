@@ -26,14 +26,10 @@ policy_python="${policy_conda_env}/bin/python"
 [[ -x "$policy_python" ]] || { echo "Pass an existing Python environment prefix as argument 8." >&2; exit 1; }
 export PATH="${policy_conda_env}/bin:$PATH"
 export PYTHONPATH="${XPL_ROOT}:$(dirname "$XPL_ROOT")${PYTHONPATH:+:$PYTHONPATH}"
-: "${LIBER0_RUNTIME_ROOT:?Set the Liber-0 runtime directory}"
 : "${LIBER0_MODEL_PATH:?Set the base model assets directory}"
-: "${LIBER0_SOURCE_PATH:?Set the backend source directory}"
 
-exec env \
-    PYTHONWARNINGS=ignore::UserWarning \
-    CUDA_VISIBLE_DEVICES="${policy_gpu_id}" \
-    "$policy_python" "${XPL_ROOT}/setup_policy_server.py" \
+export CUDA_VISIBLE_DEVICES="${policy_gpu_id}"
+exec "$policy_python" -u "${XPL_ROOT}/setup_policy_server.py" \
         --config_path "${yaml_file}" \
         --overrides \
             port="${policy_server_port}" \
@@ -45,7 +41,5 @@ exec env \
             seed="${seed}" \
             policy_name="${policy_name}" \
             action_type="${action_type}" \
-            runtime_root="${LIBER0_RUNTIME_ROOT}" \
             model_assets_path="${LIBER0_MODEL_PATH}" \
-            backend_source_path="${LIBER0_SOURCE_PATH}" \
             weights_file="${LIBER0_WEIGHTS_FILE:-model.pt}"

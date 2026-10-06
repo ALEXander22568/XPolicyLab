@@ -1,5 +1,4 @@
 """Liber-0 policy adapter."""
-import importlib
 import os
 from pathlib import Path
 import sys
@@ -11,6 +10,7 @@ import torch
 from XPolicyLab.model_template import ModelTemplate
 from XPolicyLab.utils.checkpoint_resolver import resolve_checkpoint_root
 from XPolicyLab.utils.process_data import get_robot_action_dim_info, pack_robot_state, unpack_robot_state
+from .liber0.runtime import Policy
 
 
 def _required_path(config, key):
@@ -23,23 +23,11 @@ def _required_path(config, key):
 
 
 def _load_policy(config, checkpoint_root):
-    runtime_root = _required_path(config, "runtime_root")
-    os.environ["PIXELWAM_MODEL_PATH"] = str(_required_path(config, "model_assets_path"))
-    os.environ["PIXELWAM_SOURCE_PATH"] = str(_required_path(config, "backend_source_path"))
-    # Explicit upstream runtime paths, not XPolicyLab package roots.
-    sys.path.insert(0, str(runtime_root / "wam/model"))
-    sys.path.insert(0, str(runtime_root))
-    serving = importlib.import_module("pixelwam.serving")
-    if Path(serving.__file__).resolve() != runtime_root / "wam/model/pixelwam/serving.py":
-        raise RuntimeError(f"Wrong runtime imported: {serving.__file__}")
-    return serving.Policy(
-        checkpoint_path=str(checkpoint_root / config["weights_file"]),
-        config_path=str(checkpoint_root / "config.yaml"),
-        dataset_stats_path=str(checkpoint_root / "dataset_stats.json"),
-        device=config["device"], port=0, model_dtype=torch.bfloat16,
-        action_horizon=None, robotwin_camera_layout=None,
+    return Policy(
+        checkpoint_root=checkpoint_root,
+        assets=_required_path(config, "model_assets_path"),
+        device=config["device"], weights_file=config["weights_file"],
         num_inference_steps=int(config["num_inference_steps"]),
-        seed=int(config["seed"]), rand_device="cpu", inference_compile=False,
     )
 
 
@@ -57,8 +45,6 @@ class Model(ModelTemplate):
         self.env_cfg_type = self.model_cfg["env_cfg_type"]
         if self.action_type != "joint" or self.env_cfg_type != "arx_x5":
             raise ValueError("This checkpoint supports arx_x5 joint control only.")
-        if self.model_cfg["eval_batch"]:
-            raise ValueError("Use eval_batch=false.")
         torch.set_float32_matmul_precision("highest")
         torch.backends.cuda.matmul.allow_tf32 = False
         print("[Liber-0 runtime]", sys.executable, torch.__version__, torch.version.cuda,
@@ -76,7 +62,7 @@ class Model(ModelTemplate):
         checkpoint_root = resolve_checkpoint_root(self.model_cfg, policy_dir / "checkpoints")
         self.policy = _load_policy(self.model_cfg, checkpoint_root)
         self.model = self.policy.model
-        if self.model.stack != "hidream_o1" or self.policy.robotwin_camera_layout != "four_grid_288x384":
+        if self.policy.robotwin_camera_layout != "four_grid_288x384":
             raise ValueError("Incompatible checkpoint.")
         if self.model.dit.action_dim != self.action_dim:
             raise ValueError("Checkpoint action dimension does not match the registered robot.")
@@ -89,10 +75,14 @@ class Model(ModelTemplate):
         self.reset()
 
     def update_obs(self, obs):
+        self.observation, self.instruction = self._encode_observation(obs, self.episode_cue)
+        self.episode_cue = self.observation['visual_cue_rgb']
+
+    def _encode_observation(self, obs, cue):
         vision = obs["vision"]
         head = _rgb(vision["cam_head"]["color"])
-        if self.episode_cue is None:
-            self.episode_cue = head.copy()
+        if cue is None:
+            cue = head.copy()
         instruction = obs.get("instruction", obs.get("instructions"))
         if isinstance(instruction, (list, tuple)):
             if len(instruction) != 1:
@@ -100,22 +90,22 @@ class Model(ModelTemplate):
             instruction = instruction[0]
         if not isinstance(instruction, str) or not instruction.strip():
             raise ValueError("An explicit task instruction is required.")
-        self.instruction = instruction
-        self.observation = {
+        observation = {
             "head_camera_rgb": head,
             "left_camera_rgb": _rgb(vision["cam_left_wrist"]["color"]),
             "right_camera_rgb": _rgb(vision["cam_right_wrist"]["color"]),
-            "visual_cue_rgb": self.episode_cue,
+            "visual_cue_rgb": cue,
             "joint_action_vector": np.asarray(pack_robot_state(
                 obs, self.action_type, self.robot_action_dim_info,
             ), dtype=np.float32),
         }
+        return observation, instruction
 
     def get_action(self):
         if self.observation is None:
             raise RuntimeError("Call update_obs after reset before requesting actions.")
         # Only the public run seed and local replan counter determine noise.
-        actions = np.asarray(self.policy._infer_action_chunk(
+        actions = np.asarray(self.policy.infer_action_chunk(
             self.observation, self.instruction, request_seed=self.seed + self.replan_index,
         ), dtype=np.float32)
         if actions.shape != (self.policy.action_horizon, self.action_dim) or not np.isfinite(actions).all():
@@ -124,13 +114,43 @@ class Model(ModelTemplate):
         return unpack_robot_state(actions[:self.replan_steps], self.action_type, self.robot_action_dim_info)
 
     def update_obs_batch(self, obs_list):
-        raise NotImplementedError("Use eval_batch=false and one environment per policy server.")
+        env_ids = [int(obs['env_idx']) for obs in obs_list]
+        if not env_ids or len(set(env_ids)) != len(env_ids):
+            raise ValueError('Expected nonempty observations with unique env_idx values.')
+        for env_id, obs in zip(env_ids, obs_list):
+            if env_id not in self._batch:
+                self._batch[env_id] = dict(cue=None, replan_index=0)
+            state = self._batch[env_id]
+            state['observation'], state['instruction'] = self._encode_observation(obs, state['cue'])
+            state['cue'] = state['observation']['visual_cue_rgb']
+        self._batch_order = env_ids
 
     def get_action_batch(self, env_idx_list=None):
-        raise NotImplementedError("Use eval_batch=false and one environment per policy server.")
+        env_ids = self._batch_order if env_idx_list is None else [int(value) for value in env_idx_list]
+        if not env_ids or len(set(env_ids)) != len(env_ids):
+            raise ValueError('Call update_obs_batch first and request unique env_idx values.')
+        states = [self._batch[env_id] for env_id in env_ids]
+        actions = np.asarray(self.policy.infer_action_batch(
+            [state['observation'] for state in states],
+            [state['instruction'] for state in states],
+            [self.seed + state['replan_index'] for state in states],
+        ), dtype=np.float32)
+        if actions.shape != (len(env_ids), self.policy.action_horizon, self.action_dim) or not np.isfinite(actions).all():
+            raise ValueError(f'Invalid predicted batch: {actions.shape}')
+        for state in states:
+            state['replan_index'] += 1
+        return [unpack_robot_state(action[:self.replan_steps], self.action_type, self.robot_action_dim_info)
+                for action in actions]
+
+    def reset_envs(self, env_idx_list):
+        selected = {int(value) for value in env_idx_list}
+        self._batch = {key: value for key, value in self._batch.items() if key not in selected}
+        self._batch_order = [key for key in self._batch_order if key not in selected]
 
     def reset(self):
         self.observation = None
         self.instruction = None
         self.episode_cue = None
         self.replan_index = 0
+        self._batch = {}
+        self._batch_order = []
