@@ -42,7 +42,7 @@ bash eval.sh RoboDojo stack_bowls gpt-6-astra arx_x5_rgbd joint 0 0 0 unused /pa
 - Cluttered Generalization variants are task names with the `_random` suffix (`stack_bowls_random`); they share the tools of the base task.
 - The policy server and the simulator may share one GPU (about 14 GB together). Batch evaluation is not supported (`eval_batch: false`).
 - The agent's full session for each episode (commands, observations, transcript) is written under `runs/bridge/<task>/`. `python3 eval/official_validate.py .` flags episodes in which the agent never issued a command (an infrastructure failure, not a result).
-- A typical episode takes 5 to 10 minutes of wall-clock time, almost all of it model latency, and about 0.7M input tokens (95% served from the provider's cache) and 2k output tokens.
+- A typical episode takes 5 to 10 minutes of wall-clock time, almost all of it model latency.
 
 Offline wiring check (no simulator). The policy server starts the real agent, so Docker, the Codex binaries and the endpoint are needed; the agent sees placeholder observations and the loop ends at the debug client's step limit:
 
