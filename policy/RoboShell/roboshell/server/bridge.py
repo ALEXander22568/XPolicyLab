@@ -282,9 +282,11 @@ class Model:
                 self.agent = None
                 self.relaunch_at = time.time() + RELAUNCH_WAIT_S
                 log(f"model gateway refused the acting agent before its first command; relaunch {self.relaunches} in {RELAUNCH_WAIT_S:.0f} s")
-            elif self.episode.commands == 0 and self.agent_started and time.time() - self.agent_started < 120:
+            elif (self.episode.commands == 0 and self.agent_started and time.time() - self.agent_started < 120
+                    and self.agent.returncode != 0):
                 # The agent container never worked (no network left for Docker, image missing, credentials...). Letting
                 # the run continue would record every remaining episode as a failed one. Stop the policy server instead.
+                # An agent that completed its session (exit 0) without a command chose to do nothing: that is a result.
                 tail = ""
                 try:
                     with open(os.path.join(self.agent_dir, "..", "agent.out")) as handle:
