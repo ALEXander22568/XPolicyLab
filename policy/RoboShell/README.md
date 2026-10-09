@@ -12,7 +12,8 @@ Requirements on the policy machine: the RoboDojo checkout this XPolicyLab lives 
 
 ```bash
 cd XPolicyLab/policy/RoboShell
-cp config.env.example config.env     # ISAAC_PYTHON, CODEX_BIN, MODEL_UPSTREAM, MODEL_KEY_FILE; ROBODOJO_REPO defaults to the checkout
+bash install.sh                      # first run only creates config.env from config.env.example
+vi config.env                        # fill ISAAC_PYTHON, CODEX_BIN, MODEL_UPSTREAM, MODEL_BASE_PATH, MODEL_KEY_FILE; ROBODOJO_REPO defaults to the checkout
 bash install.sh                      # builds the agent image, installs websockets>=13 for the policy server, adds the RGB-D env configs
 ./roboshell.sh check                 # optional, no GPU: one Codex turn against a fake server, verifies image, endpoint and key
 ```
