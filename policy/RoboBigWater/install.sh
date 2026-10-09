@@ -1,5 +1,5 @@
 #!/bin/bash
-# RoboShell policy environment: the agent container image, the policy-server dependency (websockets) in the Isaac
+# RoboBigWater policy environment: the agent container image, the policy-server dependency (websockets) in the Isaac
 # Sim Python, and the RGB-D observation configs. Settings come from config.env next to this file.
 #   bash install.sh
 set -euo pipefail

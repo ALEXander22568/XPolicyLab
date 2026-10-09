@@ -20,4 +20,4 @@ def eval_one_episode(TASK_ENV, model_client):
 
 
 def eval_one_episode_batch(TASK_ENV, model_client):
-    raise NotImplementedError("RoboShell evaluates one environment at a time (eval_batch: false)")
+    raise NotImplementedError("RoboBigWater evaluates one environment at a time (eval_batch: false)")

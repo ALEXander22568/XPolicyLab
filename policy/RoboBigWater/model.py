@@ -1,4 +1,4 @@
-"""XPolicyLab adapter of RoboShell: the policy is a coding agent behind the robo interface.
+"""XPolicyLab adapter of RoboBigWater: the policy is a coding agent behind the robo interface.
 
 The server, the agent container and the task tools live in this directory, so it is put on sys.path here and
 `roboshell` imports resolve wherever the policy server was started from.

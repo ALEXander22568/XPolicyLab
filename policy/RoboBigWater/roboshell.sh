@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# RoboShell entry point. Run from anywhere; settings come from config.env next to this file.
+# RoboBigWater entry point. Run from anywhere; settings come from config.env next to this file.
 #   ./roboshell.sh setup                      build the agent image, install policy deps, link into RoboDojo
 #   ./roboshell.sh check                      agent side only, no GPU: fake server + one Codex turn
 #   ./roboshell.sh serve GPU TASK [SEED]      direct mode: start robo-server (foreground)

@@ -32,7 +32,7 @@ if [ -f "${SCRIPT_DIR}/config.env" ] || [ -n "${ISAAC_PYTHON:-}" ]; then
   # shellcheck source=scripts/sim_env.sh
   source "${SCRIPT_DIR}/scripts/sim_env.sh"
 fi
-# RoboShell observes depth: its env configs are added next to the stock ones (nothing upstream is modified)
+# RoboBigWater observes depth: its env configs are added next to the stock ones (nothing upstream is modified)
 cp -n "${SCRIPT_DIR}/env_cfg/arx_x5_rgbd.yml" "${BENCH_ROOT}/env_cfg/" 2>/dev/null || true
 cp -n "${SCRIPT_DIR}/env_cfg/camera_config_rgbd.yml" "${BENCH_ROOT}/env_cfg/camera/" 2>/dev/null || true
 

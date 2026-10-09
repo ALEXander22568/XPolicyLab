@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Python packages the bridge-mode policy server needs on top of the Isaac environment.
-# Installed into .cache/policy-deps and put first on PYTHONPATH by xpolicylab/RoboShell/setup_eval_policy_server.sh.
+# Installed into .cache/policy-deps and put first on PYTHONPATH by policy/RoboBigWater/setup_eval_policy_server.sh.
 set -euo pipefail
 source "$(dirname "$0")/sim_env.sh"
 unset PIP_NO_INDEX  # sim_env.sh keeps the simulator offline; this script needs the index

@@ -2,7 +2,7 @@
 ROBOSHELL_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 export ROBOSHELL_ROOT
 if [ -f "$ROBOSHELL_ROOT/config.env" ]; then set -a; source "$ROBOSHELL_ROOT/config.env"; set +a; fi
-: "${ROBODOJO_REPO:=$(cd "$ROBOSHELL_ROOT/../../.." && pwd)}"   # XPolicyLab/policy/RoboShell sits inside the RoboDojo checkout
+: "${ROBODOJO_REPO:=$(cd "$ROBOSHELL_ROOT/../../.." && pwd)}"   # XPolicyLab/policy/RoboBigWater sits inside the RoboDojo checkout
 : "${ISAAC_PYTHON:?set ISAAC_PYTHON in config.env}"
 export ROBODOJO_REPO
 

@@ -9,7 +9,7 @@ import os
 
 from omegaconf import OmegaConf
 
-POLICY_NAME = "RoboShell"
+POLICY_NAME = "RoboBigWater"
 
 
 class NullModelClient:
