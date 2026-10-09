@@ -8,7 +8,7 @@ Shared conventions — argument meanings, checkpoint naming, split-machine deplo
 
 ## Installation
 
-Requirements on the policy machine: the RoboDojo checkout this XPolicyLab lives in, with its Isaac Sim 5.1 Python environment (cuRobo is used for IK); Docker; the Codex CLI binaries (`codex` and `codex-code-mode-host` side by side); an OpenAI Responses API endpoint that serves `gpt-6-astra`, and its key in a file.
+Requirements on the policy machine: the RoboDojo checkout this XPolicyLab lives in, with its Isaac Sim 5.1 Python environment (cuRobo is used for IK); Docker; the Codex CLI binaries (`codex` and `codex-code-mode-host` side by side; the standalone installer puts both under `~/.codex/packages/standalone/current/bin/` and `CODEX_BIN` may point to the `codex` symlink; all results here used Codex CLI 0.159.0; `install.sh` records the version it builds with in `agent/codex/CODEX_VERSION`); an OpenAI Responses API endpoint that serves `gpt-6-astra`, and its key in a file (the key is read by the egress proxy on the host and never enters the agent container).
 
 ```bash
 cd XPolicyLab/policy/RoboShell
