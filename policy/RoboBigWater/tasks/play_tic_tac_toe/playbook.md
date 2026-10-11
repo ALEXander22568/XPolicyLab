@@ -1,40 +1,39 @@
 # play_tic_tac_toe playbook
 
-## Observed results
-- Final recorded attempts: 9/10 successes; layout 0 stopped at 30% after disturbed placements. These used evolving tool versions, not a fresh evaluation of the final version.
-- Budget: 44 s = 1100 action steps at 25 Hz. Counts below exclude initial observation and commands rejected after termination.
+## Recorded results: v0.2r2
+Ten supplied final attempts: auto_success, score 100; evolving tool versions, not a fresh final-version evaluation. Counts include rejected charged commands, exclude observation/status polling and post-terminal requests.
 
-| Layout | Commands | Steps | Seconds | Successful route |
-|---|---:|---:|---:|---|
-| 1 | 27 | 996 | 39.84 | Transfers, fixed waits/clearance checks, manual angled reach |
-| 2 | 29 | 1063 | 42.52 | Corrected contact height, transfers, manual recovery |
-| 3 | 10 | 1069 | 42.76 | Four synchronized transfers, final manual placement |
-| 4 | 8 | 1084 | 43.36 | Four synchronized transfers, finish recovery, final deposit |
-| 5 | 7 | 1032 | 41.28 | Same; one explicit angled retry |
-| 6 | 7 | 1024 | 40.96 | Same; explicit angled approach after first transfer |
-| 7 | 7 | 1029 | 41.16 | Same; higher destination TCP and angled right transfers |
-| 8 | 8 | 1024 | 40.96 | Same; two finish calls after first release |
-| 9 | 8 | 1036 | 41.44 | Same; finish recovery after first and fourth releases |
+| Layout | Commands | Steps / 1100 | Seconds | finish-transfer calls |
+|---|---:|---:|---:|---:|
+| 0 | 7 | 1041 | 41.64 | 1 |
+| 1 | 7 | 1059 | 42.36 | 0 |
+| 2 | 7 | 1040 | 41.60 | 1 |
+| 3 | 8 | 1041 | 41.64 | 2 |
+| 4 | 6 | 1044 | 41.76 | 0 |
+| 5 | 6 | 1032 | 41.28 | 0 |
+| 6 | 8 | 1029 | 41.16 | 1 |
+| 7 | 7 | 1007 | 40.28 | 0 |
+| 8 | 6 | 1007 | 40.28 | 0 |
+| 9 | 8 | 1036 | 41.44 | 2 |
 
-## Procedure distilled from layouts 4–9
-1. Observe calibrated head RGB/depth with both arms home. Locate ring rims, source centers, empty cell centers, and surface heights; do not infer ring height from its hole.
-2. Convert depth pixels with camera intrinsics/extrinsics; supply world TCP contact coordinates, not object-center Z. Recompute for the observed layout and chosen orientation.
-3. Place the first ring centrally with vertical-transfer; then inspect each response and select an empty cell. Successful later moves varied with occupancy; no fixed cell sequence is established.
-4. Use open=x, clearance=0.03, automatic travel_z, approach=down initially, and wait_sec=6. The four initial transfers include vertical contacts, raised transit, release, home, and visual departure/return.
-5. On a zero-motion raised_travel preflight rejection, inspect geometry and retry explicitly with approach=down45 and suitable contact coordinates. Preserve at least 3 cm travel clearance; current tools never substitute orientation automatically.
-6. After release/home followed by return_timeout, call finish-transfer on that arm with wait_sec=3–6. Continue bounded completion waits if needed; do not re-grasp or treat timeout as permission to move.
-7. Confirm eight occupied cells and completed fourth response before deposit-transfer to the remaining cell. This endpoint omits home and response waiting; if the episode continues, use finish-transfer to complete those obligations.
-8. Inspect terminal status separately from plan_ok. episode_over during placement can accompany auto_success; report only the release/retraction actually observed.
+## Procedure
+1. With both arms home, observe calibrated head RGB/depth. Measure all cell centers, empty occupancy, source centers and rim tops; hole depth is the underlying surface. Re-measure cells after contact; never reuse episode coordinates.
+2. Choose a reachable empty cell nearest the selected source, using current occupancy after each response. Recorded attempts began centrally, but no fixed cell sequence is established. Compute world TCP fingertip contact coordinates for the selected orientation.
+3. Use vertical-transfer for the first four placements with open=x, clearance=0.03, automatic travel_z, approach=down where reachable, wait_sec=6. Keep actual transfer clearance >=3 cm above the board; endpoint-based clearance alone does not certify obstacle clearance.
+4. Let integrated departure/return synchronization finish at home before preparing another grasp. The opponent advances only with action steps; do not wait away from home or move during its response. Both arms must remain within 0.3 m and 30 degrees of their start poses while it moves.
+5. On a zero-motion raised_travel IK rejection, inspect contact geometry and retry explicitly with approach=down45. Keep that orientation fixed through release; do not lower travel clearance to gain reach.
+6. On return_timeout after release/home, resume with finish-transfer on that arm, typically wait_sec=3–6. A subsequent transfer also enforces pending completion, but inspect occupancy again before selecting its destination. Zero different pixels alone does not complete the stable-return interval.
+7. Before the fifth placement, confirm eight occupied cells and completed fourth response. Recorded attempts used deposit-transfer for the last cell; it omits home and waiting. Reserve the predicted placement cost plus >=60 steps for home both; finish retraction/home if still active, and issue home both to satisfy the final requirement.
+8. Inspect terminal status independently of plan_ok. Report only confirmed release, settling and homing; auto_success during lowering is not evidence of a fully completed final motion.
 
-## Timing and contact evidence
-- Layouts 4–9: four responses completed by 37.72–40.16 s; final deposits reached terminal success in another 3.04–3.44 s. Reserve time using preflight estimates, which exclude visual waiting.
-- Initial wait_sec=1–3 repeatedly timed out; combined first-response waits were 4.48–5.20 s. Short caps split the same wait across commands and did not authorize earlier motion.
-- Layout 8 needed finish waits of 3.0 s then 0.6 s; layout 9 needed another 0.6 s after a fourth-return timeout even with zero different pixels.
-- Observed later pickup TCP Z: 0.774–0.778 m; destination Z: 0.790–0.817 m. These are episode measurements, never reusable layout constants; layout 2 required pickup Z=0.785 after a too-low 0.755 request.
-- All later transfers used 3 cm clearance; one first transit used explicit Z=0.840. Down45 resolved reach failures but needs its own contact geometry; accurate TCP tracking alone does not establish correct placement.
-
-## Recovery limits
-- Low-contact or TCP error: inspect and correct the contact estimate before retrying. source_material_remains leaves the gripper closed at travel height; inspect before any release or recovery.
-- A clear transit box can precede delayed opponent motion. wait-clear and standalone wait-view did not establish the successful later workflow; fixed waits and manual preparation during responses caused failures elsewhere.
-- Low lateral travel and sideways pickup displaced rings. Historical low-clearance success parameters and wait_sec=0 opt-out are obsolete; 0 now selects the 6 s wait.
-- Final release was unconfirmed in layouts 1, 3–6, 8–9; layout 2 terminated during release and layout 7 reported released=true before retraction. Auto-success does not demonstrate a settled ninth placement, completed homing, or a verified draw.
+## Timing and recovery evidence
+- All ten routes: four completed vertical transfers, one zero-motion down-to-down45 reach retry, then final deposit; layouts 1, 6, 7 also corrected a zero-motion low-contact rejection. Standalone wait-clear/wait-view were unused.
+- Four placements/responses finished at 928–970 steps (37.12–38.80 s); final deposit used 74–89 more steps before terminal interruption. These are interrupted costs, not full deposit/home estimates.
+- Default 6 s visual waits stop on completion. Short 1.2–3 s caps split waits across calls without reducing physical time. Layout 9 needed 15 extra stable-return steps after a 5 s cap despite zero changed pixels.
+- Layouts 7/8 used 460/450 visual-wait steps; layout 9 used 485. Use observation-driven waits, not fixed delays; preflight motion estimates exclude these waits.
+- Measured successful TCP heights ranged 0.773–0.780 m at source and 0.789–0.817 m at destination; these are evidence only. Angled contacts sometimes needed 4–5 mm height adjustment, never an automatic universal correction.
+- contact_below_visible_surface: inspect rim height and correct TCP Z. source_center_misaligned: re-measure source XY and inspect alignment_check.suggested_source; suggested Z is unchanged, not a height estimate.
+- destination_changed: inspect current occupancy and select a freshly measured empty cell. The guard detects new relief, not pre-existing occupancy; inconclusive depth is not proof of emptiness.
+- source_material_remains leaves the gripper closed at travel height; inspect before any release. Missing relief and commanded closure cannot certify holding.
+- Existing rings shifted by up to 8.9 mm in successful logs. Accurate TCP tracking and a passing depth guard do not establish collision-free transfer or the required <=18 mm placement error relative to each cell.
+- Every final deposit ended with episode_over; release was reported true only for layouts 0–2, and retraction/home was unconfirmed in all ten. Remaining budget was 41–93 steps; layouts 0, 1, 3, 4 fell below the 60-step home reserve. Their success does not validate final settling, homing, or a draw.

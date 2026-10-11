@@ -67,6 +67,28 @@ def circle_fit(xy):
     return origin+c[:2], radius, rms
 
 
+def surface_labels(points, mask):
+    """Four-neighbor connectivity with a metric depth-discontinuity gate.
+
+    An expanded pixel lattice encodes edges for OpenCV, avoiding Python graph
+    traversal. No closing may bridge an occlusion boundary or invent evidence.
+    """
+    h, w = mask.shape
+    lattice = np.zeros((2*h-1, 2*w-1), np.uint8)
+    lattice[::2, ::2] = mask
+    for axis in (0, 1):
+        a = (slice(None, -1), slice(None)) if axis == 0 else (slice(None), slice(None, -1))
+        b = (slice(1, None), slice(None)) if axis == 0 else (slice(None), slice(1, None))
+        connected = mask[a] & mask[b]
+        connected &= np.linalg.norm(points[a]-points[b], axis=-1) <= .012
+        if axis == 0:
+            lattice[1::2, ::2] = connected
+        else:
+            lattice[::2, 1::2] = connected
+    count, labels = cv2.connectedComponents(lattice, connectivity=4)
+    return count, labels[::2, ::2]
+
+
 def measure(rgb, depth, intrinsic, extrinsic, color, support=None, min_pixels=20):
     points = unproject(depth, intrinsic, extrinsic)
     valid = np.isfinite(points).all(axis=-1) & np.isfinite(depth) & (depth > 0)
@@ -91,10 +113,16 @@ def measure(rgb, depth, intrinsic, extrinsic, color, support=None, min_pixels=20
         mask = valid.copy()
     mask &= (points[..., 2] > support+.006) & (points[..., 2] < support+.5)
     observed_mask = mask.copy()
-    mask = cv2.morphologyEx(mask.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
-    count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    if color == "surface":
+        count, labels = surface_labels(points, mask)
+    else:
+        mask = cv2.morphologyEx(mask.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+        count, labels = cv2.connectedComponents(mask, connectivity=8)
     objects = []
+    populations = np.bincount(labels[observed_mask], minlength=count)
     for i in range(1, count):
+        if populations[i] < min_pixels:
+            continue
         # Closing establishes connectivity only; measurements retain the
         # original depth/height/hue criteria instead of filling in evidence.
         component = (labels == i) & observed_mask
@@ -120,17 +148,26 @@ def measure(rgb, depth, intrinsic, extrinsic, color, support=None, min_pixels=20
             candidate = np.median(centers, axis=0)
             if np.max(np.linalg.norm(centers-candidate, axis=1)) < .012:
                 center = candidate.tolist()
-        x, y, w, h, _ = stats[i].tolist()
+        rows, cols = np.nonzero(component)
+        x, y = int(cols.min()), int(rows.min())
+        xmax, ymax = int(cols.max()), int(rows.max())
+        contact = None
+        if center is not None:
+            section = min(body, key=lambda s: abs(s["z"]-(support+.4*height)))
+            contact = {"center_xyz": [*center, section["z"]],
+                       "diameter_m": section["diameter_m"],
+                       "kind": "surface_section_not_tcp_pose"}
         color_pixels = {name: int(np.count_nonzero(component & selection & chromatic_mask))
                         for name, selection in hues.items()}
         dominant = max(color_pixels, key=color_pixels.get)
         if color_pixels[dominant] < min_pixels:
             dominant = None
-        objects.append({"pixel_bbox": [x, y, x+w-1, y+h-1], "pixels": len(cloud),
+        objects.append({"pixel_bbox": [x, y, xmax, ymax], "pixels": len(cloud),
                         "dominant_color": dominant, "color_pixels": color_pixels,
                         "surface_bounds_m": [lo.tolist(), hi.tolist()],
                         "top_z": float(hi[2]), "height_m": height,
                         "body_center_xy": center, "circular_sections": slices,
+                        "body_contact": contact,
                         "center_status": "estimated_round_body" if center else "unresolved",
                         "warning": "Visible geometry only; occlusion and noncircular profiles can bias estimates."})
     objects.sort(key=lambda o: o["pixel_bbox"][0])

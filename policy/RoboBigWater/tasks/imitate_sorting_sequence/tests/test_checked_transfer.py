@@ -85,6 +85,258 @@ class API:
 
 
 class TransferTests(unittest.TestCase):
+    def test_combined_setup_reduces_stops_and_executes_checked_route(self):
+        api = API()
+        estimate = api.estimate_tcp_chain
+        def costs(arm, route):
+            report = estimate(arm, route)
+            report['transfer_action_steps'] = 10 * len(route)
+            return report
+        with patch.object(api, 'estimate_tcp_chain', side_effect=costs):
+            result, code = self.call(api, [{'visual_lift_evidence': True}] * 20,
+                                     command='roi-transfer', roi='25,25,55,55')
+        self.assertEqual(code, 0)
+        self.assertEqual(result['preflight']['selected_grasp']['setup'], 'combined')
+        self.assertEqual([s['stage'] for s in result['stages']][:4],
+                         ['raise', 'rotate', 'open', 'descend'])
+        self.assertEqual(len(api.moves), 7)
+        self.assertTrue(any(len(route) == len(api.moves) and all(
+            np.allclose(actual, expected) for actual, (_, expected) in zip(api.moves, route))
+            for route in api.estimates))
+        self.assertGreaterEqual(api.moves[0][2, 3], api.moves[1][2, 3])
+        self.assertGreater(api.moves[1][2, 3], api.moves[2][2, 3])
+        for pose in api.moves[2:]:
+            np.testing.assert_allclose(pose[:3, :3], api.moves[1][:3, :3])
+        self.assertTrue(result['released'])
+
+    def test_both_tilt_signs_compete_on_cost(self):
+        api = API()
+        estimate = api.estimate_tcp_chain
+        def costs(arm, route):
+            report = estimate(arm, route)
+            r = dict(route)['rotate'][:3, :3]
+            if abs(r[2, 0]) > .9:
+                return dict(estimate_ok=False, reason='ik_unreachable')
+            # Positive tilt has approach = cross(z, closing) * sin(tilt).
+            positive = np.dot(r[:3, 0], np.cross([0, 0, 1], r[:3, 1])) > 0
+            report['transfer_action_steps'] = 200 if positive else 50
+            return report
+        with patch.object(api, 'estimate_tcp_chain', side_effect=costs):
+            result, code = self.call(api, command='roi-check', roi='25,25,55,55')
+        self.assertEqual(code, 0)
+        self.assertEqual(result['preflight']['selected_grasp']['tilt_deg'], -30)
+        self.assertEqual(api.steps, 0)
+
+    def test_cheapest_feasible_setup_selected_in_vertical_tier(self):
+        api = API()
+        estimate = api.estimate_tcp_chain
+        def costs(arm, route):
+            report = estimate(arm, route)
+            report['transfer_action_steps'] = 70 if route[1][0] == 'above' else 140
+            return report
+        with patch.object(api, 'estimate_tcp_chain', side_effect=costs):
+            result, code = self.call(api, command='roi-check', roi='25,25,55,55')
+        self.assertEqual(code, 0)
+        self.assertEqual(result['preflight']['selected_grasp']['setup'], 'translate_first')
+        self.assertEqual(result['preflight']['selected_grasp']['tilt_deg'], 0)
+        self.assertEqual(result['preflight']['transfer_action_steps'], 78)
+        self.assertEqual(api.steps, 0)
+
+    def test_budget_rejected_before_gate_without_spending_home_reserve(self):
+        api = API()
+        api.steps = 1320  # 280 remaining < 108 transfer + 50 gate + 150 home.
+        result, code = self.call(api)
+        self.assertEqual(code, 2)
+        self.assertEqual(result['plan_fail_reason'], 'insufficient_steps_with_home_reserve')
+        self.assertEqual(api.steps, 1320)
+        self.assertEqual(api.moves, [])
+        self.assertEqual(result['preflight']['home_reserve_steps'], 150)
+
+    def test_budget_rechecked_after_unusually_long_gate(self):
+        api = API()
+        api.steps = 1280
+        def slow_gate(api):
+            api.steps += 100
+            return dict(plan_ok=True), 0
+        with patch.object(tool, 'visual_gate', side_effect=slow_gate):
+            result, code = self.call(api)
+        self.assertEqual(code, 2)
+        self.assertEqual(result['plan_fail_reason'], 'insufficient_steps_with_home_reserve')
+        self.assertEqual(api.moves, [])
+
+    def test_failed_descent_is_not_retried_and_cache_is_episode_scoped(self):
+        api = API()
+        move = api.move_tcp
+        def fail_low(arm, target, feedback):
+            code = move(arm, target, feedback)
+            if target[2, 3] < .95:
+                api.pose[2, 3] += .043
+            return code
+        with patch.object(api, 'move_tcp', side_effect=fail_low):
+            result, code = self.call(api)
+        self.assertEqual(result['plan_fail_reason'], 'motion_tracking_error')
+        self.assertEqual(result['stages'][-1]['stage'], 'descend')
+        before = api.steps
+        result, code = self.call(api)
+        self.assertEqual(result['plan_fail_reason'], 'preflight_previous_tracking_failure')
+        self.assertEqual(api.steps, before)
+        result, code = self.call(API(), command='transfer-check')
+        self.assertEqual(code, 0)
+        api.steps = 0  # Clock rewind invalidates even reused handles.
+        result, code = self.call(api, command='transfer-check')
+        self.assertEqual(code, 0)
+
+    def test_failed_orientation_allows_different_candidate(self):
+        api = API()
+        pose = api.tcp()
+        pose[:3, :3] = tool.vertical_rotation(0)
+        tool.remember_failure(api, api, 'descend', pose)
+        rejected = tool.preflight(api, api, [('descend', pose)])
+        self.assertEqual(rejected['reason'], 'previous_tracking_failure')
+        alternative = pose.copy()
+        alternative[:3, :3] = tool.vertical_rotation(30)
+        self.assertTrue(tool.preflight(api, api, [('descend', alternative)])['estimate_ok'])
+
+    def test_destination_footprint_detects_edge_even_above_nominal_top(self):
+        reference = np.array([[-.04, -.02, .82], [.04, .02, .82]])
+        goal, dest = np.array([0., 0., .81]), np.array([.3, .2, .84])
+        # A rim intersects one end while the center ray is clear.
+        points = np.array([[[.338, .18 + i * .004, .87] for i in range(10)]])
+        def check(p, d=dest, g=goal, r=reference, floor=.8, landing=None):
+            with patch.object(tool, 'cloud', return_value=(p, None, np.ones(p.shape[:2], bool))):
+                return tool.destination_check({}, r, g, d, floor, release_above=.04,
+                                              landing_floor_z=landing)
+        self.assertFalse(check(points)['clear_of_visible_obstructions'])
+        floor_points = points.copy()
+        floor_points[:, :, 2] = .83
+        self.assertFalse(check(floor_points)['clear_of_visible_obstructions'])
+        self.assertTrue(check(floor_points, landing=.83)['clear_of_visible_obstructions'])
+        self.assertTrue(check(points, d=dest + [.1, 0, 0])['clear_of_visible_obstructions'])
+        self.assertTrue(check(points[:, :1])['clear_of_visible_obstructions'])
+        offset = np.array([-.4, .5, .2])
+        self.assertFalse(check(points + offset, dest + offset, goal + offset,
+                               reference + offset, 1.)['clear_of_visible_obstructions'])
+
+    def test_raising_release_cannot_hide_obstacles_in_fall_path(self):
+        reference = np.array([[-.04, -.02, .82], [.04, .02, .82]])
+        goal = np.array([0., 0., .81])
+        points = np.array([[[.338, .18 + i * .004, .85] for i in range(10)]])
+        with patch.object(tool, 'cloud', return_value=(points, None, np.ones((1, 10), bool))):
+            for height in (.84, .90, .98):
+                for allowance in (0., .04, .06):
+                    report = tool.destination_check({}, reference, goal,
+                        np.array([.3, .2, height]), .8, release_above=allowance)
+                    self.assertFalse(report['clear_of_visible_obstructions'])
+                    self.assertEqual(report['swept_bottom_z'], .8)
+                    self.assertEqual(report['occupied_cells'], 10)
+
+    def test_landing_floor_validation_and_forwarding_for_all_commands(self):
+        for command in ('transfer-check', 'roi-check', 'grasp-transfer', 'roi-transfer'):
+            for plane in (float('nan'), float('inf'), 1.2, 'bad'):
+                api = API()
+                result, code = self.call(api, command=command, roi='20,20,60,60',
+                                         landing_floor_z=plane)
+                self.assertEqual(code, 2)
+                self.assertFalse(result['released'])
+                self.assertEqual(api.steps, 0)
+            api = API()
+            with patch.object(tool, 'destination_check', wraps=tool.destination_check) as check, \
+                    patch.object(tool, 'receiving_plane_check', return_value={'confirmed': True}):
+                result, code = self.call(api, [{'visual_lift_evidence': True}] * 10,
+                    command=command, roi='20,20,60,60', landing_floor_z=.82)
+            self.assertEqual(code, 0)
+            self.assertEqual(result['destination_check']['landing_floor_z'], .82)
+            self.assertEqual(check.call_count, 1 if command.endswith('check') else 2)
+            for call in check.call_args_list:
+                self.assertEqual(call.args[-1], .82)
+
+    def test_receiving_plane_needs_broad_surface_not_a_ledge_or_center_point(self):
+        x, y = np.meshgrid(np.linspace(.26, .34, 41), np.linspace(.18, .22, 21))
+        points = np.stack([x, y, np.full_like(x, .83)], axis=-1)
+        lo, hi = np.array([.26, .18]), np.array([.34, .22])
+        for mode in ('plane', 'ledge', 'center', 'lower', 'higher', 'missing', 'occluded'):
+            with self.subTest(mode=mode):
+                p = points.copy()
+                valid = np.ones(x.shape, bool)
+                if mode == 'ledge':
+                    p[x < .332, 2] = .8
+                elif mode == 'center':
+                    p[(abs(x - .30) > .004) | (abs(y - .20) > .004), 2] = .8
+                elif mode in ('lower', 'higher'):
+                    p[:, :, 2] += -.009 if mode == 'lower' else .009
+                elif mode == 'missing':
+                    valid[:] = False
+                    p[:] = np.nan
+                elif mode == 'occluded':
+                    p[:, :, 2] = .95
+                report = tool.receiving_plane_check(p, valid, lo, hi, .83)
+                self.assertEqual(report['confirmed'], mode == 'plane')
+        offset = np.array([-.4, .5, .2])
+        report = tool.receiving_plane_check(points + offset, np.ones(x.shape, bool),
+                                           lo + offset[:2], hi + offset[:2], 1.03)
+        self.assertTrue(report['confirmed'])
+
+    def test_receiving_plane_uses_calibrated_camera_points(self):
+        obs = observation(missing=True)
+        points, _, valid = tool.cloud(obs)
+        lo, hi = np.array([-.08, -.04]), np.array([.08, .04])
+        self.assertTrue(tool.receiving_plane_check(points, valid, lo, hi, .8)['confirmed'])
+        self.assertFalse(tool.receiving_plane_check(points, valid, lo, hi, .83)['confirmed'])
+
+    def test_raised_plane_cannot_hide_a_narrow_rim(self):
+        reference = np.array([[-.04, -.02, .82], [.04, .02, .82]])
+        goal, dest = np.array([0., 0., .81]), np.array([.3, .2, .9])
+        x, y = np.meshgrid(np.linspace(.26, .34, 41), np.linspace(.18, .22, 21))
+        points = np.stack([x, y, np.full_like(x, .83)], axis=-1)
+        for broad in (True, False):
+            p = points.copy()
+            if not broad:
+                p[x < .332, 2] = .8
+            with patch.object(tool, 'cloud', return_value=(p, None, np.ones(x.shape, bool))):
+                report = tool.destination_check({}, reference, goal, dest, .8, landing_floor_z=.83)
+            self.assertTrue(report['clear_of_visible_obstructions'])
+            self.assertEqual(report['receiving_plane_ok'], broad)
+
+    def test_unconfirmed_plane_prevents_motion_and_is_rechecked_after_gate(self):
+        for command in ('transfer-check', 'roi-check', 'grasp-transfer', 'roi-transfer'):
+            api = API()
+            result, code = self.call(api, command=command, roi='20,20,60,60',
+                                     to_z=.94, landing_floor_z=.83)
+            self.assertEqual((code, result['plan_fail_reason']), (2, 'landing_plane_unconfirmed'))
+            self.assertEqual(api.steps, 0)
+            self.assertEqual(api.moves, [])
+            self.assertEqual(api.grips, [])
+        for command in ('grasp-transfer', 'roi-transfer'):
+            api = API()
+            with patch.object(tool, 'receiving_plane_check',
+                              side_effect=[{'confirmed': True}, {'confirmed': False}]):
+                result, code = self.call(api, command=command, roi='20,20,60,60',
+                                         to_z=.94, landing_floor_z=.83)
+            self.assertEqual((code, result['plan_fail_reason']), (2, 'landing_plane_unconfirmed'))
+            self.assertEqual(api.steps, 50)
+            self.assertEqual(api.moves, [])
+            self.assertEqual(api.grips, [])
+
+    def test_destination_rejection_is_free_and_rechecks_after_gate(self):
+        blocked = dict(clear_of_visible_obstructions=False, occupied_cells=10)
+        clear = dict(clear_of_visible_obstructions=True, occupied_cells=0)
+        for command in ('transfer-check', 'roi-check', 'grasp-transfer', 'roi-transfer'):
+            api = API()
+            with patch.object(tool, 'destination_check', return_value=blocked):
+                result, code = self.call(api, command=command, roi='20,20,60,60')
+            self.assertEqual(result['plan_fail_reason'], 'destination_obstructed')
+            self.assertEqual(code, 2)
+            self.assertEqual(api.steps, 0)
+            self.assertEqual(api.moves, [])
+        api = API()
+        with patch.object(tool, 'destination_check', side_effect=[clear, blocked]):
+            result, code = self.call(api)
+        self.assertEqual(result['plan_fail_reason'], 'destination_obstructed')
+        self.assertEqual(api.steps, 50)
+        self.assertEqual(api.moves, [])
+        self.assertEqual(api.grips, [])
+        self.assertTrue(tool.continuation_ready(api))
+
     def release_api(self, offset=(0, .004, .027), angle=3.6,
                     clipped=False, failed=False, reject_recovery=False):
         class BlockedDescent(API):
@@ -148,7 +400,7 @@ class TransferTests(unittest.TestCase):
                              else 'visual_grasp_unconfirmed')
             self.assertFalse(result['released'])
             self.assertEqual(api.grips, [1, 0])
-            self.assertFalse(tool.continuation_ready(api))
+            self.assertTrue(tool.continuation_ready(api))
 
     def test_motionless_rejections_preserve_continuation(self):
         api = API()
@@ -172,7 +424,7 @@ class TransferTests(unittest.TestCase):
         result, code = self.call(api, [{'visual_lift_evidence': True}] * 20)
         self.assertEqual(code, 0)
         self.assertEqual(result['visual_gate']['action_steps'], 10)
-        self.assertEqual(result['preflight']['quiet_gate_action_steps_range'], [50, 150])
+        self.assertEqual(result['preflight']['quiet_gate_action_steps_range'], [10, 150])
 
     def test_motionless_failure_cannot_restore_stale_continuation(self):
         for change in ('rewind', 'nonfinite', 'episode_over'):
@@ -219,7 +471,72 @@ class TransferTests(unittest.TestCase):
             self.assertEqual(result['visual_gate']['action_steps'],
                              50 if change == 'episode' else 10)
 
-    def test_failed_continuation_invalidates_short_gate(self):
+    def test_rotation_shares_transfer_evidence_across_module_loads(self):
+        spec = importlib.util.spec_from_file_location(
+            'separate_registry_vision', Path(tool.__file__).parents[1] / 'vision_checks/tool.py')
+        vision = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(vision)
+        for explicit, expected in ((None, 10), (2., 50)):
+            api = API()
+            self.call(api, [{'visual_lift_evidence': True}] * 20)
+            api.hold(18)  # An intervening base movement does not erase initialization.
+            args = dict(arm='right', preset='down')
+            if explicit is not None:
+                args['quiet'] = explicit
+            with patch.object(vision, 'rotation', return_value=np.eye(3)):
+                result, code = vision.run(api, 'point-still', args)
+            self.assertEqual(code, 0)
+            self.assertEqual(result['visual_check']['action_steps'], expected)
+            self.assertTrue(tool.continuation_ready(api))
+            result, code = self.call(api, [{'visual_lift_evidence': True}] * 20)
+            self.assertEqual(code, 0)
+            self.assertEqual(result['visual_gate']['action_steps'], 10)
+
+    def test_rotation_failure_consumes_transfer_evidence(self):
+        vision = tool._visual_module
+        for failure in ('motion', 'quietness', 'exception'):
+            api = API()
+            self.call(api, [{'visual_lift_evidence': True}] * 20)
+            args = dict(arm='right', preset='down', timeout=2)
+            api.animate = failure == 'quietness'
+            with patch.object(vision, 'rotation', return_value=np.eye(3)):
+                if failure == 'motion':
+                    with patch.object(api, 'move_tcp', return_value=2):
+                        result, code = vision.run(api, 'point-still', args)
+                elif failure == 'exception':
+                    with patch.object(api, 'move_tcp', side_effect=RuntimeError('backend')):
+                        result, code = vision.run(api, 'point-still', args)
+                else:
+                    count = len(api.moves)
+                    result, code = vision.run(api, 'point-still', args)
+                    self.assertEqual(len(api.moves), count)
+            self.assertEqual(code, 2)
+            self.assertFalse(tool.continuation_ready(api))
+            api.animate = False
+            result, code = self.call(api, [{'visual_lift_evidence': True}] * 20)
+            self.assertEqual(code, 0)
+            self.assertEqual(result['visual_gate']['action_steps'], 50)
+
+    def test_auto_rotation_requires_valid_transfer_initialization(self):
+        vision = tool._visual_module
+        for change in ('none', 'new_episode', 'rewind', 'right_handle'):
+            api = API()
+            if change != 'none':
+                self.call(api, [{'visual_lift_evidence': True}] * 20)
+            if change == 'new_episode':
+                api = API()
+            elif change == 'rewind':
+                api.steps = 0
+            elif change == 'right_handle':
+                other = API()
+                api.arm = lambda tag: api if tag == 'left' else other
+            with patch.object(vision, 'rotation', return_value=np.eye(3)):
+                result, code = vision.run(api, 'point-still', dict(arm='left', preset='down'))
+            self.assertEqual(code, 0)
+            self.assertEqual(result['visual_check']['action_steps'], 50)
+            self.assertFalse(tool.continuation_ready(api))
+
+    def test_manipulation_failure_preserves_quiet_initialization(self):
         api = API()
         self.call(api, [{'visual_lift_evidence': True}] * 20)
         result, code = self.call(api, [{'visual_lift_evidence': False}])
@@ -227,7 +544,7 @@ class TransferTests(unittest.TestCase):
         self.assertEqual(result['visual_gate']['action_steps'], 10)
         result, code = self.call(api, [{'visual_lift_evidence': True}] * 20)
         self.assertEqual(code, 0)
-        self.assertEqual(result['visual_gate']['action_steps'], 50)
+        self.assertEqual(result['visual_gate']['action_steps'], 10)
 
     def test_continuation_still_rejects_full_frame_motion(self):
         api = API()
@@ -241,16 +558,91 @@ class TransferTests(unittest.TestCase):
         self.assertEqual(len(api.moves), count)
         self.assertFalse(tool.continuation_ready(api))
 
+    def test_failed_manipulation_cannot_skip_fresh_quietness(self):
+        api = API()
+        result, code = self.call(api, [{'visual_lift_evidence': False}])
+        self.assertEqual(code, 2)
+        self.assertTrue(tool.continuation_ready(api))
+        api.animate = True
+        before = len(api.moves)
+        result, code = self.call(api)
+        self.assertEqual(code, 2)
+        self.assertEqual(result['plan_fail_reason'], 'visual_motion_timeout')
+        self.assertEqual(len(api.moves), before)
+        self.assertFalse(tool.continuation_ready(api))
+        api.animate = False
+        result, code = self.call(api, [{'visual_lift_evidence': True}] * 20)
+        self.assertEqual(code, 0)
+        self.assertEqual(result['visual_gate']['action_steps'], 50)
+
+    def test_quiet_initialization_tracks_latest_public_clock(self):
+        api = API()
+        self.call(api, [{'visual_lift_evidence': True}] * 20)
+        api.steps += 20
+        self.assertTrue(tool.continuation_ready(api))
+        api.steps -= 10
+        self.assertFalse(tool.continuation_ready(api))
+
     def call(self, api, outcomes=None, command='grasp-transfer', **changes):
         args = dict(arm='left', x=0, y=0, z=.9, to_x=-.3, to_y=0, to_z=.91,
-                    floor_z=.8, roi='30,30,50,50')
+                    floor_z=.8, roi='30,30,50,50', release_above=0.)
         args.update(changes)
+        if args['release_above'] is None:
+            args.pop('release_above')
         core = types.ModuleType('roboshell.server.core')
         core.tool_rotation = lambda *a: np.eye(3)
         modules = {'roboshell': types.ModuleType('roboshell'),
                    'roboshell.server': types.ModuleType('roboshell.server'), 'roboshell.server.core': core}
         with patch.dict(sys.modules, modules), patch.object(tool, 'evidence', side_effect=outcomes):
             return tool.run(api, command, args)
+
+    def test_default_release_avoids_low_contact_in_both_transfer_commands(self):
+        for command in ('grasp-transfer', 'roi-transfer'):
+            with self.subTest(command=command):
+                api = self.release_api()
+                result, code = self.call(api, [{'visual_lift_evidence': True}] * 20,
+                                         command=command, roi='25,25,55,55',
+                                         release_above=None)
+                self.assertEqual(code, 0)
+                self.assertTrue(result['released'])
+                np.testing.assert_allclose(api.moves[-2][:3, 3], [-.3, 0, .95])
+                self.assertAlmostEqual(api.moves[-1][2, 3], 1.01)
+                self.assertEqual(result['stages'][-3]['release_above_m'], .04)
+                # Execution and every successful preview use the same release height.
+                for chain in api.estimates:
+                    lower = dict(chain)['lower']
+                    self.assertAlmostEqual(lower[2, 3], .95)
+                self.assertEqual(len(result['visual_checks']), 3)
+
+    def test_release_allowance_invalid_values_do_not_move(self):
+        for value in (-.001, .061, float('nan'), float('inf')):
+            api = API()
+            result, code = self.call(api, release_above=value)
+            self.assertEqual(code, 2)
+            self.assertEqual(result['plan_fail_reason'], 'invalid_arguments')
+            self.assertEqual(api.moves, [])
+            self.assertEqual(api.steps, 0)
+
+    def test_raised_release_requires_fresh_retention(self):
+        api = API()
+        result, code = self.call(api, [{'visual_lift_evidence': True}] * 2 +
+                                 [{'visual_lift_evidence': False}], release_above=None)
+        self.assertEqual(code, 2)
+        self.assertEqual(result['plan_fail_reason'], 'visual_grasp_unconfirmed')
+        self.assertFalse(result['released'])
+        self.assertEqual(api.grips, [1, 0])
+
+    def test_release_allowance_does_not_stack_with_blocked_descent_fallback(self):
+        class BlockedRaisedRelease(API):
+            def move_tcp(self, arm, target, feedback):
+                code = super().move_tcp(arm, target, feedback)
+                if np.allclose(target[:3, 3], [-.3, 0, .95]):
+                    self.pose[2, 3] += .02
+                return code
+        result, code = self.call(BlockedRaisedRelease(),
+                                 [{'visual_lift_evidence': True}] * 20, release_above=None)
+        self.assertEqual(code, 2)
+        self.assertFalse(result['released'])
 
     def test_diagonal_geometry_candidates_rotate_with_surface(self):
         x, y = np.meshgrid(np.linspace(-.015, .015, 15), np.linspace(-.05, .05, 35))
@@ -275,7 +667,7 @@ class TransferTests(unittest.TestCase):
         api.reject_estimate = 1
         result, code = self.call(api, command='roi-check', roi='25,25,55,55')
         self.assertEqual(code, 0)
-        self.assertEqual(len(api.estimates), 2)
+        self.assertGreaterEqual(len(api.estimates), 2)
         candidates = result['preflight']['candidate_checks']
         self.assertFalse(candidates[0]['estimate_ok'])
         self.assertTrue(candidates[1]['estimate_ok'])
@@ -291,7 +683,7 @@ class TransferTests(unittest.TestCase):
                 estimate_ok=False, reason='ik_unreachable', failed_stage='above')) as estimate:
             result, code = self.call(api, command='roi-transfer', roi='25,25,55,55')
         self.assertEqual(code, 2)
-        self.assertLessEqual(estimate.call_count, 50)
+        self.assertLessEqual(estimate.call_count, 150)
         self.assertEqual(api.steps, 0)
         self.assertEqual(api.moves, [])
         self.assertEqual(result['plan_fail_reason'], 'preflight_ik_unreachable')
@@ -306,12 +698,64 @@ class TransferTests(unittest.TestCase):
                 self.assertAlmostEqual(r[2, 0], -np.cos(np.deg2rad(tilt)))
                 np.testing.assert_allclose(r[:, 1], tool.vertical_rotation(yaw)[:, 1])
 
+    def test_deferred_rotation_restores_vertical_route_before_steep_tilt(self):
+        api = API()
+        estimate = api.estimate_tcp_chain
+        def source_rotation_only(arm, route):
+            report = estimate(arm, route)
+            # Model setup-dependent IK: vertical rotation is feasible over
+            # the source, while rotation at the previous release needs tilt.
+            poses = dict(route)
+            if (abs(poses['rotate'][2, 0]) > .9
+                    and not np.allclose(poses['rotate'][:2, 3], poses['descend'][:2, 3])):
+                return dict(estimate_ok=False, reason='ik_unreachable', failed_stage='rotate')
+            return report
+        with patch.object(api, 'estimate_tcp_chain', side_effect=source_rotation_only):
+            preview, code = self.call(api, command='roi-check', roi='25,25,55,55')
+            self.assertEqual(code, 0)
+            self.assertEqual(api.steps, 0)
+            self.assertEqual(api.moves, [])
+            self.assertEqual(preview['preflight']['selected_grasp']['tilt_deg'], 0)
+            self.assertEqual(preview['preflight']['selected_grasp']['setup'], 'translate_first')
+            result, code = self.call(api, [{'visual_lift_evidence': True}] * 20,
+                                     command='roi-transfer', roi='25,25,55,55')
+        self.assertEqual(code, 0)
+        self.assertEqual([s['stage'] for s in result['stages']][:5],
+                         ['raise', 'above', 'rotate', 'open', 'descend'])
+        self.assertTrue(any(len(route) == len(api.moves) for route in api.estimates))
+        self.assertTrue(any(len(route) == len(api.moves) and all(
+            np.allclose(actual, expected) for actual, (_, expected) in zip(api.moves, route))
+            for route in api.estimates[len(api.estimates)//2:]))
+        np.testing.assert_allclose(api.moves[0][:3, :3], api.moves[1][:3, :3])
+        for actual in api.moves[2:]:
+            np.testing.assert_allclose(actual[:3, :3], api.moves[2][:3, :3])
+        self.assertTrue(result['released'])
+
+    def test_deferred_setup_rechecks_after_gate_and_stops_on_tracking_failure(self):
+        for changed_scene in (False, True):
+            with self.subTest(changed_scene=changed_scene):
+                api = API(drift=not changed_scene)
+                estimate = api.estimate_tcp_chain
+                def deferred_only(arm, route):
+                    report = estimate(arm, route)
+                    if route[1][0] != 'above' or (changed_scene and api.steps):
+                        return dict(estimate_ok=False, reason='ik_unreachable', failed_stage='above')
+                    return report
+                with patch.object(api, 'estimate_tcp_chain', side_effect=deferred_only):
+                    result, code = self.call(api, command='roi-transfer', roi='25,25,55,55')
+                self.assertEqual(code, 2)
+                self.assertEqual(result['plan_fail_reason'],
+                                 'preflight_ik_unreachable' if changed_scene else 'motion_tracking_error')
+                self.assertEqual(len(api.moves), 0 if changed_scene else 1)
+                self.assertEqual(api.grips, [])
+                self.assertFalse(result['released'])
+
     def test_tilt_search_is_free_and_preserves_narrow_pinch(self):
         api = API()
         estimate = api.estimate_tcp_chain
         def tilted_only(arm, route):
             report = estimate(arm, route)
-            rotation = route[1][1][:3, :3]
+            rotation = dict(route)["rotate"][:3, :3]
             if abs(rotation[2, 0]) > .9:
                 return dict(estimate_ok=False, reason='ik_unreachable', failed_stage='above')
             return report
@@ -319,7 +763,8 @@ class TransferTests(unittest.TestCase):
             result, code = self.call(api, command='roi-check', roi='25,25,55,55')
         self.assertEqual(code, 0)
         checks = result['preflight']['candidate_checks']
-        self.assertTrue(all(c['tilt_deg'] == 0 for c in checks[:-1]))
+        self.assertTrue(all(c['tilt_deg'] in (0, 30, -30) for c in checks))
+        self.assertTrue(all(not c['estimate_ok'] for c in checks if c['tilt_deg'] == 0))
         chosen = result['preflight']['selected_grasp']
         self.assertEqual(chosen['tilt_deg'], 30)
         self.assertEqual(chosen['closing_direction'][2], 0.)
@@ -334,7 +779,7 @@ class TransferTests(unittest.TestCase):
         estimate = api.estimate_tcp_chain
         def tilted_only(arm, route):
             report = estimate(arm, route)
-            if abs(route[1][1][2, 0]) > .9:
+            if abs(dict(route)["rotate"][2, 0]) > .9:
                 return dict(estimate_ok=False, reason='ik_unreachable', failed_stage='above')
             return report
         with patch.object(api, 'estimate_tcp_chain', side_effect=tilted_only):
@@ -344,8 +789,9 @@ class TransferTests(unittest.TestCase):
         count = len(result['preflight']['candidate_checks'])
         self.assertEqual(len(api.estimates), 2 * count)
         self.assertEqual(api.first_move_step, 50)
-        for actual, (_, expected) in zip(api.moves, api.estimates[-1]):
-            np.testing.assert_allclose(actual, expected)
+        self.assertTrue(any(len(route) == len(api.moves) and all(
+            np.allclose(actual, expected) for actual, (_, expected) in zip(api.moves, route))
+            for route in api.estimates[len(api.estimates)//2:]))
         for actual in api.moves[1:]:
             np.testing.assert_allclose(actual[:3, :3], api.moves[1][:3, :3])
         self.assertTrue(result['released'])
@@ -355,7 +801,7 @@ class TransferTests(unittest.TestCase):
         estimate = api.estimate_tcp_chain
         def before_gate_only(arm, route):
             report = estimate(arm, route)
-            if api.steps or abs(route[1][1][2, 0]) > .9:
+            if api.steps or abs(dict(route)["rotate"][2, 0]) > .9:
                 return dict(estimate_ok=False, reason='ik_unreachable', failed_stage='above')
             return report
         with patch.object(api, 'estimate_tcp_chain', side_effect=before_gate_only):
@@ -367,14 +813,15 @@ class TransferTests(unittest.TestCase):
 
     def test_roi_refits_search_and_executes_selected_targets(self):
         api = API()
-        api.reject_estimate = 2  # First candidate after the gate fails.
+        api.reject_estimate = 21  # First candidate after the 20-candidate initial tier fails.
         result, code = self.call(api, [{'visual_lift_evidence': True}] * 20,
                                  command='roi-transfer', roi='25,25,55,55')
         self.assertEqual(code, 0)
-        self.assertEqual(len(api.estimates), 3)
+        self.assertEqual(len(api.estimates), 60)
         self.assertEqual(api.first_move_step, 50)
-        for actual, (_, expected) in zip(api.moves, api.estimates[-1]):
-            np.testing.assert_allclose(actual, expected)
+        self.assertTrue(any(len(route) == len(api.moves) and all(
+            np.allclose(actual, expected) for actual, (_, expected) in zip(api.moves, route))
+            for route in api.estimates[len(api.estimates)//2:]))
         self.assertTrue(result['released'])
 
     def test_explicit_yaw_is_validated_and_applied(self):
@@ -428,10 +875,47 @@ class TransferTests(unittest.TestCase):
                                  via='-.1,.1')
         self.assertEqual(code, 0)
         self.assertEqual(len(api.estimates), 2)
-        self.assertEqual(len(api.moves), len(api.estimates[-1]))
-        for actual, (_, expected) in zip(api.moves, api.estimates[-1]):
-            np.testing.assert_allclose(actual, expected)
+        self.assertTrue(any(len(route) == len(api.moves) for route in api.estimates))
+        self.assertTrue(any(len(route) == len(api.moves) and all(
+            np.allclose(actual, expected) for actual, (_, expected) in zip(api.moves, route))
+            for route in api.estimates[len(api.estimates)//2:]))
         self.assertTrue(result['released'])
+
+    def test_long_carry_is_continuous_and_preserves_clearance_and_bends(self):
+        for via in ('', '-.15,.12'):
+            api = API()
+            result, code = self.call(api, [{'visual_lift_evidence': True}] * 20,
+                                     to_x=-.65, via=via)
+            self.assertEqual(code, 0)
+            route = api.estimates[-1]
+            carries = [pose for name, pose in route if name == 'carry']
+            self.assertEqual(len(carries), 2 if via else 1)
+            np.testing.assert_allclose(carries[-1][:3, 3], [-.65, 0, 1.01])
+            if via:
+                np.testing.assert_allclose(carries[0][:3, 3], [-.15, .12, 1.01])
+            for pose in carries:
+                np.testing.assert_allclose(pose[:3, :3], api.moves[4][:3, :3])
+            self.assertEqual(len(result['visual_checks']), 1 + len(carries))
+            for actual, (_, expected) in zip(api.moves, route):
+                np.testing.assert_allclose(actual, expected)
+
+    def test_continuous_carry_failure_never_lowers_or_releases(self):
+        api = API()
+        original_move = api.move_tcp
+        def fail_carry(arm, target, feedback):
+            code = original_move(arm, target, feedback)
+            if np.allclose(target[:3, 3], [-.65, 0, 1.01]):
+                feedback.update(plan_ok=False, plan_fail_reason='ik_unreachable')
+                return 2
+            return code
+        api.move_tcp = fail_carry
+        result, code = self.call(api, [{'visual_lift_evidence': True}] * 20,
+                                 to_x=-.65)
+        self.assertEqual(code, 2)
+        self.assertEqual(result['plan_fail_reason'], 'ik_unreachable')
+        self.assertEqual(result['stages'][-1]['stage'], 'carry')
+        self.assertEqual(api.grips, [1, 0])
+        self.assertFalse(result['released'])
 
     def test_geometry_is_motionless_and_below_visible_top(self):
         api = API()
@@ -585,6 +1069,49 @@ class TransferTests(unittest.TestCase):
         for field in ('depth', 'png', 'cameras'):
             empty[field]['cam_left_wrist'] = empty[field]['cam_head']
         self.assertFalse(tool.evidence(empty, ref, shades, [0, 0, .1])['visual_lift_evidence'])
+
+    def test_wrist_source_needs_consistency_with_visible_head_depth(self):
+        ref, shades = tool.template(observation(), (30, 30, 50, 50),
+                                    np.array([0, 0, .9]), .8)
+        for mode in ('clear', 'stationary', 'occluded', 'missing', 'near'):
+            with self.subTest(mode=mode):
+                obs = observation(missing=True)
+                depth = obs['depth']['cam_head']
+                depth[30:50, 55:75] = .8
+                rgb = np.full((80, 80, 3), 220, dtype=np.uint8)
+                rgb[30:50, 55:75] = [20, 120, 30]
+                if mode != 'clear':
+                    depth[28:52, 28:52] = dict(stationary=.9, occluded=.5,
+                                             missing=float('nan'), near=.904)[mode]
+                    if mode == 'stationary':
+                        rgb[28:52, 28:52] = [20, 120, 30]
+                stream = io.BytesIO()
+                Image.fromarray(rgb).save(stream, format='PNG')
+                obs['png']['cam_head'] = stream.getvalue()
+                wrist = observation()
+                for field in ('depth', 'png', 'cameras'):
+                    obs[field]['cam_right_wrist'] = wrist[field]['cam_head']
+                report = tool.evidence(obs, ref, shades, [.1, 0, .1], floor_z=.8)
+                self.assertGreater(report['translated_surface_fraction'], .85)
+                self.assertEqual(report['visual_lift_evidence'], mode == 'clear')
+                if mode == 'clear':
+                    self.assertGreater(report['camera_source_conflicts']['cam_right_wrist'], 0)
+                    self.assertEqual(report['camera_source_fractions']['cam_right_wrist'], 0)
+                else:
+                    self.assertGreater(report['original_surface_fraction'], .35)
+
+    def test_source_consistency_keeps_edges_and_requires_full_depth_patch(self):
+        obs = observation(missing=True)
+        points = np.array([[[0., 0., .9], [-.18, 0., .9]]])
+        valid = np.ones((1, 2), dtype=bool)
+        ref = points.reshape(-1, 3)
+        filtered, count = tool.source_consistency(obs, points, valid, ref)
+        self.assertEqual(count, 1)
+        np.testing.assert_array_equal(filtered, [[False, True]])
+        obs['depth']['cam_head'][39, 39] = .5
+        filtered, count = tool.source_consistency(obs, points, valid, ref)
+        self.assertEqual(count, 0)
+        np.testing.assert_array_equal(filtered, valid)
 
     def test_no_transfer_or_release_when_lift_unconfirmed(self):
         api = API()

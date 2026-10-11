@@ -1,5 +1,6 @@
 """Guarded Cartesian transfer using only public motion and RGB-D observations."""
 import cv2
+import json
 import numpy as np
 from types import SimpleNamespace
 from pathlib import Path
@@ -25,6 +26,12 @@ try:
 except (OSError, ValueError, KeyError):
     _LINK3_HULL = None
 
+try:
+    with np.load(Path(__file__).with_name('link2_hull.npz'), allow_pickle=False) as data:
+        _LINK2_HULL = (data['bounds'].copy(), data['planes'].copy())
+except (OSError, ValueError, KeyError):
+    _LINK2_HULL = None
+
 TOOL = {"name": "guarded_transfer", "commands": [{
     "name": "guarded_transfer", "budget": True,
     "help": "grasp, verify visual lift, carry, release and withdraw vertically",
@@ -41,10 +48,25 @@ TOOL = {"name": "guarded_transfer", "commands": [{
         {"name": "support_z", "type": "float", "help": "support elevation; otherwise estimated from horizontal depth patches"},
         {"name": "payload_radius", "type": "float", "default": .06},
         {"name": "margin", "type": "float", "default": .025},
-        {"name": "approach", "type": "str", "default": "down",
-         "choices": ["down", "down45"]},
-        {"name": "open", "type": "str", "default": "x", "choices": ["x", "y"]},
+        {"name": "approach", "type": "str", "default": "auto",
+         "choices": ["auto", "down", "down45"]},
+        {"name": "open", "type": "str", "default": "auto", "choices": ["auto", "x", "y"]},
     ]}]}
+
+TOOL["commands"].append(dict(
+    TOOL["commands"][0], name="transfer_plan", budget=False,
+    help="read-only complete transfer preflight; never moves or closes the gripper"))
+
+TOOL["commands"].append({
+    "name": "contact_pose", "budget": False,
+    "help": "convert an opposed contact section to a calibrated TCP candidate without motion",
+    "args": [
+        {"name": "arm", "positional": True, "choices": ["left", "right"]},
+        *[{"name": key, "type": "float", "required": True}
+          for key in ("x", "y", "z", "diameter", "support_z")],
+        {"name": "approach", "type": "str", "default": "down", "choices": ["down", "down45"]},
+        {"name": "open", "type": "str", "default": "x", "choices": ["x", "y"]},
+    ]})
 
 
 TOOL["commands"].append({
@@ -200,6 +222,18 @@ def link3_pose(ee, joints):
     return bracket @ np.linalg.inv(child)
 
 
+def link2_pose(ee, joints):
+    """Recover upper arm using the public joint3 origin then joint rotation."""
+    forearm = link3_pose(ee, joints)  # validates measured pose and all angles
+    c, s = np.cos(joints[2]), np.sin(joints[2])
+    cr, sr = np.cos(3.1416), np.sin(3.1416)
+    child = np.eye(4)
+    child[:3, :3] = (np.array([[1., 0., 0.], [0., cr, -sr], [0., sr, cr]])
+                       @ np.array([[c, 0., s], [0., 1., 0.], [-s, 0., c]]))
+    child[:3, 3] = [-.264, 0., 0.]
+    return forearm @ np.linalg.inv(child)
+
+
 def active_arm_geometry(api, arm):
     """World collision spheres from public joints/FK, never scene state.
 
@@ -248,6 +282,8 @@ def active_arm_geometry(api, arm):
                     result["link4_pose"] = link4_pose(arm.ee(), arm.joints())
                 if _LINK3_HULL is not None:
                     result["link3_pose"] = link3_pose(arm.ee(), arm.joints())
+                if _LINK2_HULL is not None:
+                    result["link2_pose"] = link2_pose(arm.ee(), arm.joints())
             except (ValueError, TypeError):
                 pass
         return result
@@ -315,6 +351,9 @@ def modeled_arm_points(points, geometry):
     link3 = geometry.get("link3_pose")
     if link3 is not None and _LINK3_HULL is not None:
         hulls.append((_LINK3_HULL, (points-link3[:3, 3]) @ link3[:3, :3], link3[:3, :3]))
+    link2 = geometry.get("link2_pose")
+    if link2 is not None and _LINK2_HULL is not None:
+        hulls.append((_LINK2_HULL, (points-link2[:3, 3]) @ link2[:3, :3], link2[:3, :3]))
     camera_ee = geometry.get("camera_ee")
     if camera_ee is not None:
         local = (points-camera_ee[:3, 3]) @ camera_ee[:3, :3]
@@ -539,6 +578,48 @@ def camera_cloud(observation, camera, color):
     return cloud[np.isfinite(cloud).all(axis=1)]
 
 
+def verification_observation(observation, geometry, endpoint_z):
+    """Remove elevated calibrated self-depth from an immutable view snapshot.
+
+    Use the corridor's source protections: coarse spheres cannot erase contact
+    evidence below the current TCP + 2 cm; detailed hulls cannot erase evidence
+    below the requested endpoint + 2 cm. Unknown geometry retains all depth.
+    Apply the same mask to every view so alternate baselines do not reintroduce
+    the arm as a payload. This neither clips tall surfaces nor fills occlusion.
+    """
+    if geometry.get("status") != "available":
+        return observation, {}
+    depths = dict(observation.get("depth", {}))
+    counts = {}
+    for camera, calibration in observation.get("cameras", {}).items():
+        try:
+            depth = np.asarray(depths[camera], dtype=float)
+            k = np.asarray(calibration["intrinsics"], dtype=float)
+            transform = np.asarray(calibration["extrinsics_world"], dtype=float)
+            if (depth.ndim != 2 or k.shape != (3, 3) or transform.shape != (4, 4)
+                    or not np.isfinite(k).all() or not np.isfinite(transform).all()):
+                continue
+            v, u = np.nonzero(np.isfinite(depth) & (depth > 0))
+            rays = np.column_stack((u, v, np.ones(len(u)))) @ np.linalg.inv(k).T
+            points = (rays*depth[v, u, None]) @ transform[:3, :3].T + transform[:3, 3]
+            model = depth_geometry(geometry, observation, camera)
+            floor = float(endpoint_z)+.02
+            coarse = points[:, 2] > max(floor, float(geometry["tcp_z"])+.02)
+            detailed = (points[:, 2] > floor) & ~coarse
+            mask = np.zeros(len(points), dtype=bool)
+            mask[coarse] = modeled_arm_points(points[coarse], model)
+            mask[detailed] = modeled_arm_points(points[detailed], dict(model, spheres=[]))
+            filtered = depth.copy()
+            filtered[v[mask], u[mask]] = np.nan
+            depths[camera] = filtered
+            counts[camera] = int(mask.sum())
+        except (KeyError, ValueError, TypeError, np.linalg.LinAlgError):
+            # Incomplete optional views stay untouched; normal evidence checks
+            # still decide whether they can be used.
+            continue
+    return dict(observation, depth=depths), counts
+
+
 def visible_cloud(observation, camera, color, xy, radius, bounds=None):
     cloud = camera_cloud(observation, camera, color)
     cloud = cloud[np.linalg.norm(cloud[:, :2]-xy, axis=1) < radius]
@@ -595,22 +676,48 @@ def surface_lift(before, after, expected):
             "matched_points": count, "matched_xy_cells": cells}
 
 
-def depth_lift(baseline, observation, camera, xy, radius, expected, support):
+def depth_baselines(observation, camera, xy, radius, support, baseline):
+    """Capture other calibrated views before motion, within the source height band.
+
+    Do not merge clouds: a view with different visible faces must independently
+    support translation, without borrowing coverage from another camera.
+    """
+    primary = camera if camera in observation.get("cameras", {}) else "cam_"+camera
+    baselines = {primary: baseline}
+    bounds = (support+.008, float(np.max(baseline[:, 2]))+.02)
+    for name in sorted(observation.get("cameras", {})):
+        if name == primary:
+            continue
+        try:
+            cloud = visible_cloud(observation, name, "surface", xy, radius, bounds)
+            if surface_lift(cloud, cloud+[0., 0., .04], .04)["verified"]:
+                baselines[name] = cloud
+        except (KeyError, ValueError, TypeError, np.linalg.LinAlgError):
+            continue
+    return baselines
+
+
+def depth_lift(baseline, observation, camera, xy, radius, expected, support, baselines=None):
     """Match depth in calibrated views, excluding support and unrelated heights."""
     primary = camera if camera in observation.get("cameras", {}) else "cam_"+camera
     names = [primary] + [n for n in sorted(observation.get("cameras", {})) if n != primary]
     attempts = []
-    bounds = (support+.008+max(.5*expected, expected-.01),
-              float(np.max(baseline[:, 2]))+expected+.02)
     for name in names:
-        try:
-            cloud = visible_cloud(observation, name, "surface", xy, radius, bounds)
-            evidence = surface_lift(baseline, cloud, expected)
-            attempts.append(dict(evidence, camera=name))
-            if evidence["verified"]:
-                return {"verified": True, "camera": name, "attempts": attempts}
-        except (KeyError, ValueError, TypeError, np.linalg.LinAlgError) as exc:
-            attempts.append({"camera": name, "verified": False, "reason": str(exc)})
+        references = [(primary, baseline)]
+        if name != primary and baselines is not None and name in baselines:
+            references.insert(0, (name, baselines[name]))
+        for reference_name, reference in references:
+            bounds = (support+.008+max(.5*expected, expected-.01),
+                      float(np.max(reference[:, 2]))+expected+.02)
+            try:
+                cloud = visible_cloud(observation, name, "surface", xy, radius, bounds)
+                evidence = surface_lift(reference, cloud, expected)
+                attempts.append(dict(evidence, camera=name, baseline_camera=reference_name))
+                if evidence["verified"]:
+                    return {"verified": True, "camera": name, "attempts": attempts}
+            except (KeyError, ValueError, TypeError, np.linalg.LinAlgError) as exc:
+                attempts.append({"camera": name, "baseline_camera": reference_name,
+                                 "verified": False, "reason": str(exc)})
     return {"verified": False, "attempts": attempts}
 
 
@@ -632,9 +739,41 @@ def open_hand_hits(local, distances, padding, margin):
     return hits
 
 
+def aperture_hand_hits(local, distances, padding, margin):
+    """Conservative boxes cover each finger's entire 44 mm opening travel.
+
+    Opening is unknown before grasp and changes again at release. Open-only
+    hulls leave the closed finger positions unchecked. Keep the wrist cap.
+    """
+    tolerance = margin + .003
+    hits = (distances < padding) & (local[:, 0] < tolerance)
+    origins = ([0., 0., 0.], [.08657, .024896, -.0002436],
+               [.08657, -.0249, -.00024366])
+    for index, ((bounds, _), origin) in enumerate(zip(_HAND_HULLS, origins)):
+        lo, hi = bounds.copy() + np.asarray(origin)
+        if index == 1:
+            hi[1] += .044
+        elif index == 2:
+            lo[1] -= .044
+        hits |= np.all(local >= lo-tolerance, axis=1) & np.all(local <= hi+tolerance, axis=1)
+    return hits
+
+
 def descent_scene_clearance(observation, args, arm, source, rotation, high_z, support,
                             active_geometry):
-    """Check a fixed-orientation descending hand against observed scene depth."""
+    return _hand_scene_clearance(observation, args, arm, source, rotation, high_z,
+                                 support, active_geometry)
+
+
+def transfer_scene_clearance(observation, args, arm, source, rotation, support,
+                             active_geometry, suffix):
+    return _hand_scene_clearance(observation, args, arm, source, rotation, source[2],
+                                 support, active_geometry, suffix=suffix)
+
+
+def _hand_scene_clearance(observation, args, arm, source, rotation, high_z, support,
+                          active_geometry, suffix=None):
+    """Check descent or the full fixed-orientation post-grasp hand sweep."""
     active_geometry = depth_geometry(active_geometry, observation, args.get("camera", "head"))
     cloud = camera_cloud(observation, args.get("camera", "head"), "surface")
     cloud = cloud[cloud[:, 2] > support+.008]
@@ -660,32 +799,37 @@ def descent_scene_clearance(observation, args, arm, source, rotation, high_z, su
     nearest = np.full(len(cloud), np.inf)
     refined_hits = np.zeros(len(cloud), dtype=bool)
     calibrated = active_geometry.get("hand_hardware") == "x5a"
-    count = max(1, int(np.ceil(abs(high_z-source[2])/.005)))
-    for z in np.linspace(high_z, source[2], count+1):
-        tcp = np.r_[source[:2], z]
-        fractions = (np.clip((cloud-tcp) @ offset / length_sq, 0., 1.)
-                     if length_sq > 1e-12 else np.zeros(len(cloud)))
-        distances = np.linalg.norm(cloud-tcp-fractions[:, None]*offset, axis=1)
-        nearest = np.minimum(nearest, distances)
-        if calibrated:
-            # Descent follows an explicit open command. Test the existing
-            # open-hand collision hulls in the FUTURE end-link frame; this
-            # narrows the capsule without subtracting any observed surfaces.
-            # Keep its proximal cap: future wrist joints are not measured.
-            local = (cloud-tcp-offset) @ rotation
-            refined_hits |= open_hand_hits(local, distances, padding, float(args.get("margin", .025)))
+    paths = ([("descend", np.r_[source[:2], high_z], source)] if suffix is None
+             else [(name, previous, xyz) for previous, (name, xyz) in
+                   zip([source] + [xyz for _, xyz in suffix[:-1]], suffix)])
+    failed_stage = None
+    for name, start, end in paths:
+        count = max(1, int(np.ceil(np.linalg.norm(end-start)/.005)))
+        for tcp in np.linspace(start, end, count+1):
+            fractions = (np.clip((cloud-tcp) @ offset / length_sq, 0., 1.)
+                         if length_sq > 1e-12 else np.zeros(len(cloud)))
+            distances = np.linalg.norm(cloud-tcp-fractions[:, None]*offset, axis=1)
+            nearest = np.minimum(nearest, distances)
+            if calibrated:
+                local = (cloud-tcp-offset) @ rotation
+                checker = open_hand_hits if suffix is None else aperture_hand_hits
+                refined_hits |= checker(local, distances, padding, float(args.get("margin", .025)))
+        if np.count_nonzero(refined_hits if calibrated else nearest < padding) >= 6:
+            failed_stage = name
+            break
     hit_points = cloud[refined_hits if calibrated else nearest < padding]
     hits = len(hit_points)
     blocked = hits >= 6
     return dict(plan_ok=not blocked,
-                plan_fail_reason="scene_in_descent_path" if blocked else None,
-                failed_stage="descend" if blocked else None,
+                plan_fail_reason=("scene_in_descent_path" if suffix is None else "scene_in_transfer_path") if blocked else None,
+                failed_stage=failed_stage if blocked else None,
                 scene_pixels=hits, hand_padding_m=padding,
-                hand_envelope="open_hulls_with_wrist_cap" if calibrated else "capsule",
+                hand_envelope=(("open_hulls_with_wrist_cap" if suffix is None else "all_aperture_boxes_with_wrist_cap")
+                               if calibrated else "capsule"),
                 active_arm_excluded_pixels=excluded,
                 scene_bounds_world=(dict(min=hit_points.min(axis=0).tolist(),
                                          max=hit_points.max(axis=0).tolist()) if hits else None),
-                detail="Observed depth inside descending hand envelope; source footprint excluded.")
+                detail="Observed depth inside hand sweep; only original source footprint excluded.")
 
 
 def pose_is_noop(start, xyz, rotation):
@@ -734,6 +878,7 @@ def approach_scene_clearance(api, observation, args, arm, targets, support, acti
     offset = np.asarray(arm.tcp_to_ee)[:3, 3]
     length_sq = float(offset @ offset)
     padding = .075 + float(args.get("margin", .025)) + .0025
+    escaped_pixels = 0
     for name, xyz, rotation in targets:
         # Execution leaves the pose unchanged for these stages. Computing
         # acos(trace(R.T @ R)) first can fabricate a tiny rotation even for
@@ -749,6 +894,28 @@ def approach_scene_clearance(api, observation, args, arm, targets, support, acti
         # angular sampling radius includes the hand extent, not just its axis.
         calibrated = (active_geometry.get("hand_hardware") == "x5a"
                       and arm.gripper() >= .999)
+        # An initial safety-shell overlap need not block a strictly separating
+        # vertical departure. Keep the entire unpadded capsule (including its
+        # 2.5 mm sampling allowance), not just the thinner hand hulls. Points
+        # below both axis endpoints get monotonically farther from every axis
+        # point during this translation. Never apply this to endpoint evidence,
+        # rotation, lateral motion, unknown hardware or subsequent stages.
+        escape = np.zeros(len(cloud), dtype=bool)
+        if (calibrated and name == "raise" and
+                np.array_equal(start, arm.tcp()) and
+                np.allclose(rotation, start[:3, :3], atol=1e-10, rtol=0.) and
+                np.linalg.norm(np.asarray(xyz)[:2]-start[:2, 3]) < 1e-10 and
+                xyz[2] > start[2, 3] and "to_x" in args and "to_y" in args):
+            axis = rotation @ offset
+            delta = cloud-start[:3, 3]
+            projection = (np.clip(delta @ axis / length_sq, 0., 1.)
+                          if length_sq > 1e-12 else np.zeros(len(cloud)))
+            initial_distance = np.linalg.norm(delta-projection[:, None]*axis, axis=1)
+            guard = float(args.get("payload_radius", .06))+float(args.get("margin", .025))
+            escape = ((cloud[:, 2] < min(start[2, 3], start[2, 3]+axis[2])) &
+                      (initial_distance > .075+.0025) &
+                      (np.linalg.norm(cloud[:, :2]-[args["x"], args["y"]], axis=1) > guard) &
+                      (np.linalg.norm(cloud[:, :2]-[args["to_x"], args["to_y"]], axis=1) > guard))
         for fraction in np.linspace(0., 1., count+1):
             tcp = start[:3, 3]+fraction*(xyz-start[:3, 3])
             sample_rotation = api.geometry.slerp(start[:3, :3], rotation, fraction)
@@ -761,17 +928,25 @@ def approach_scene_clearance(api, observation, args, arm, targets, support, acti
                 local = (cloud-tcp-axis) @ sample_rotation
                 refined_hits |= open_hand_hits(local, distances, padding,
                                                float(args.get("margin", .025)))
+        # Require full requested clearance at the end, with no exemption
+        # carried into the next stage's rotation/translation checks.
+        if calibrated and escape.any():
+            escape &= (distances >= padding) & (nearest > .075+.0025)
+            escaped_pixels += int(np.count_nonzero(refined_hits & escape))
+            refined_hits &= ~escape
         hit_points = cloud[refined_hits if calibrated else nearest < padding]
         hits = len(hit_points)
         if hits >= 6:
             return dict(plan_ok=False, plan_fail_reason="scene_in_approach_path",
                         failed_stage=name, scene_pixels=hits, hand_padding_m=padding,
                         active_arm_excluded_pixels=excluded,
+                        departure_margin_escape_pixels=escaped_pixels,
                         hand_envelope="open_hulls_with_wrist_cap" if calibrated else "capsule",
                         scene_bounds_world=dict(min=hit_points.min(axis=0).tolist(),
                                                 max=hit_points.max(axis=0).tolist()))
         start[:3, :3], start[:3, 3] = rotation, xyz
-    return dict(plan_ok=True, plan_fail_reason=None, active_arm_excluded_pixels=excluded)
+    return dict(plan_ok=True, plan_fail_reason=None, active_arm_excluded_pixels=excluded,
+                departure_margin_escape_pixels=escaped_pixels)
 
 
 def opposite_hand_clearance(api, arm, targets):
@@ -813,6 +988,31 @@ def opposite_hand_clearance(api, arm, targets):
                             detail="Opposite hand occupies the swept hand envelope; no motion executed.")
         start[:3, :3], start[:3, 3] = rotation, xyz
     return dict(plan_ok=True, plan_fail_reason=None, hand_axis_distance_m=minimum)
+
+
+def cached_hand_clearance(api, arm, targets, cache):
+    """Reuse a rejected identical prefix only within one immutable preflight.
+
+    A different carry route cannot repair a collision in an unchanged approach.
+    Never reuse a successful prefix as certification for an unchecked suffix.
+    The caller owns the cache and discards it before any physical motion.
+    """
+    key = tuple((name, tuple(np.asarray(xyz)), tuple(np.asarray(rotation).ravel()))
+                for name, xyz, rotation in targets)
+    for length in range(1, len(key)+1):
+        previous = cache.get(key[:length])
+        if previous is not None and (not previous["plan_ok"] or length == len(key)):
+            return dict(previous)
+    result = opposite_hand_clearance(api, arm, targets)
+    if result["plan_ok"]:
+        cache[key] = dict(result)
+    else:
+        # Only a uniquely identified checked stage bounds the failed prefix.
+        indices = [i for i, target in enumerate(targets)
+                   if target[0] == result.get("failed_stage")]
+        failed_key = key[:indices[0]+1] if len(indices) == 1 else key
+        cache[failed_key] = dict(result)
+    return dict(result)
 
 
 def preflight_path(api, arm, targets):
@@ -865,12 +1065,13 @@ def alternate_lift(before, after, camera, color, xy, radius, expected):
     view must match distributed translated surface points, not just a higher
     top or a closed gripper. Missing views do not trigger robot motion.
     """
-    baseline = visible_cloud(before, camera, color, xy, radius)
     primary = camera if camera in after.get("cameras", {}) else "cam_"+camera
+    names = [name for name in sorted(after.get("cameras", {})) if name != primary]
+    if not names:
+        return {"verified": False, "attempts": []}
+    baseline = visible_cloud(before, camera, color, xy, radius)
     attempts = []
-    for name in sorted(after.get("cameras", {})):
-        if name == primary:
-            continue
+    for name in names:
         try:
             cloud = visible_cloud(after, name, color, xy, radius)
             evidence = surface_lift(baseline, cloud, expected)
@@ -883,6 +1084,124 @@ def alternate_lift(before, after, camera, color, xy, radius, expected):
 
 
 def run(api, command, args):
+    """Select a checked orientation without retrying any physical action."""
+    if command == "contact_pose":
+        return contact_pose(api, args)
+    if command not in ("guarded_transfer", "transfer_plan") or (
+            args.get("approach", "auto") != "auto" and args.get("open", "auto") != "auto"):
+        return run_fixed(api, command, args)
+    # Each candidate uses the same endpoints, arm and guards.
+    # run_fixed completes all preflight checks before its first motion.
+    # In particular, never try another orientation after an execution failure,
+    # since even a failed approach may have displaced the source.
+    attempts = []
+    approaches = ("down", "down45") if args.get("approach", "auto") == "auto" else (args["approach"],)
+    openings = ("x", "y") if args.get("open", "auto") == "auto" else (args["open"],)
+    for approach, opening in ((a, o) for a in approaches for o in openings):
+        candidate = dict(args, approach=approach, open=opening)
+        result, code = run_fixed(api, command, candidate)
+        check = result.get("preflight") or {}
+        attempts.append(dict(approach=approach, open=opening, plan_ok=result["plan_ok"],
+                             plan_fail_reason=result.get("plan_fail_reason"),
+                             stage=result.get("stage"),
+                             failed_stage=check.get("failed_stage"),
+                             attempt_count=check.get("attempt_count", 0)))
+        if code == 0 and result["plan_ok"]:
+            result["selected_approach"] = approach
+            result["selected_open"] = opening
+            result["orientation_attempts"] = attempts
+            return result, code
+        # Input/perception failures cannot be repaired by rotating the hand.
+        if (result.get("stage") != "preflight" or result.get("stages")
+                or result.get("grip_command_closed") or result.get("released")):
+            result["selected_approach"] = approach if result.get("stages") else None
+            result["selected_open"] = opening if result.get("stages") else None
+            result["orientation_attempts"] = attempts
+            return result, code
+    result["planning_only"] = command == "transfer_plan"
+    result["selected_approach"] = None
+    result["selected_open"] = None
+    result["orientation_attempts"] = attempts
+    return result, code
+
+
+def contact_pose(api, args):
+    """Nominal opposed-pad geometry, with no implicit motion or grasp certification.
+
+    Public finger hulls have their inner flat faces at y=+/- .0244944,
+    spanning x=.056 to .071. The midpoint x=.0635, z=0 lies on both
+    faces, away from their bevels. Joint travel translates these faces in y.
+    These are hardware constants, independent of the observed scene.
+    """
+    try:
+        from roboshell.server.core import tool_rotation
+        if args.get("arm") not in ("left", "right"):
+            raise ValueError("invalid arm")
+        center = np.array([float(args[k]) for k in ("x", "y", "z")])
+        diameter, support = float(args["diameter"]), float(args["support_z"])
+        if not np.isfinite(np.r_[center, diameter, support]).all() or not .001 <= diameter <= .15:
+            raise ValueError("finite coordinates and diameter in .001–.15 m required")
+        approach, opening = args.get("approach", "down"), args.get("open", "x")
+        if approach not in ("down", "down45") or opening not in ("x", "y"):
+            raise ValueError("invalid orientation")
+        arm = api.arm(args["arm"])
+        offset = np.eye(4)
+        offset[0, 3] = -.145
+        if not np.allclose(arm.tcp_to_ee, offset, atol=1e-6):
+            raise ValueError("unsupported TCP calibration")
+        rotation = tool_rotation(approach, opening, arm.tcp()[:3, :3])
+        if abs(rotation[2, 1]) > .01:
+            raise ValueError("closing axis must be horizontal for a horizontal circular section")
+        pad_midpoint = np.array([.08657+.0635-.145, -.000002, -.00024363])
+        tcp = center-rotation @ pad_midpoint
+        closed_gap = 2*(.024898-.0244944)
+        contact_opening = (diameter-closed_gap)/(.044*2)
+        height = grasp_height_report(arm, rotation, tcp[2], center[2])
+        bottom = height["finger_lowest_z_bound"]
+        # Full opening sweep is bounded, including low fingers in tilted poses.
+        gap_ok = 0. <= contact_opening <= 1.
+        support_ok = bottom >= support+.002
+        reason = None if gap_ok and support_ok else (
+            "contact_outside_aperture" if not gap_ok else "fingers_intersect_support")
+        return {"plan_ok": reason is None, "plan_fail_reason": reason,
+                "tcp_candidate": tcp.tolist(), "approach": approach, "open": opening,
+                "contact_center": center.tolist(), "contact_opening_fraction": float(contact_opening),
+                "opposed_contact_points": [(center+sign*diameter/2*rotation[:, 1]).tolist()
+                                           for sign in (-1, 1)],
+                "finger_lowest_z_bound": bottom,
+                "minimum_contact_center_z": float(center[2]+support+.002-bottom),
+                "warning": "Nominal pad geometry only; section must be circular about the supplied center. Reach, scene clearance, contact stability and placement are unchecked; failed candidates are not executable."}, 0 if reason is None else 2
+    except Exception as exc:
+        return {"plan_ok": False, "plan_fail_reason": "invalid_arguments",
+                "plan_detail": str(exc)}, 2
+
+
+def grasp_height_report(arm, rotation, source_z, surface_top):
+    """Conservative finger reach bound from public hardware, not a grasp fit.
+
+    Include all corners of both finger bounds across their full opening travel.
+    The box overapproximation can miss empty grasps, but cannot shorten reach.
+    """
+    offset = np.eye(4)
+    offset[0, 3] = -.145
+    if not np.allclose(arm.tcp_to_ee, offset, atol=1e-6):
+        return None
+    from itertools import product
+    corners = []
+    for (bounds, _), sign in zip(_HAND_HULLS[1:], (1., -1.)):
+        for opening in (0., .044):
+            origin = np.array([.08657, sign*(.0249+opening), -.000244])
+            corners.extend(np.array(list(product(*zip(bounds[0], bounds[1]))))+origin)
+    local = np.asarray(corners)+offset[:3, 3]
+    lowest = float(np.min(local @ np.asarray(rotation)[2]))
+    upper = float(surface_top-lowest+.008)
+    return {"observed_top_z": float(surface_top), "requested_tcp_z": float(source_z),
+            "finger_lowest_z_bound": float(source_z+lowest),
+            "tcp_z_upper_bound": upper, "height_compatible": bool(source_z <= upper),
+            "warning": "Visible surface only; this upper bound is not a grasp pose or contact guarantee."}
+
+
+def run_fixed(api, command, args):
     if command == "transfer_clearance":
         try:
             result = corridor_clearance(api.observe(), args)
@@ -897,16 +1216,26 @@ def run(api, command, args):
     lifted = False
     released = False
     lift_measurement = None
+    grasp_height = None
+    verification_filter = {}
+    planning_only = command == "transfer_plan"
 
     def failure(reason, detail):
-        return {"plan_ok": False, "plan_fail_reason": reason, "plan_detail": str(detail),
+        # Structured reports already live below; duplicating them as a string
+        # can bury the actionable evidence in a truncated CLI response.
+        message = (detail.get("detail") or detail.get("plan_fail_reason", reason)
+                   if isinstance(detail, dict) else str(detail))
+        return {"plan_ok": False, "plan_fail_reason": reason, "plan_detail": message,
+                "planning_only": planning_only,
+                "grasp_height": grasp_height,
+                "verification_filter": verification_filter,
                 "stage": phase, "stages": stages, "grip_command_closed": holding,
                 "visual_lift_verified": lifted, "released": released,
                 "lift_measurement": lift_measurement, "clearance_report": clearance_report,
                 "preflight": preflight}, 2
 
     try:
-        if command != "guarded_transfer" or args.get("arm") not in ("left", "right"):
+        if command not in ("guarded_transfer", "transfer_plan") or args.get("arm") not in ("left", "right"):
             raise ValueError("invalid command or arm")
         source = np.array([float(args[k]) for k in ("x", "y", "z")])
         destination = np.array([float(args[k]) for k in ("to_x", "to_y", "to_z")])
@@ -944,8 +1273,12 @@ def run(api, command, args):
         # Comparing a partially hidden pre-grasp surface with the exposed lifted
         # surface overestimates rise, and can reject a correctly carried payload.
         phase = "measure_before"
-        before_observation = api.observe()
+        before_observation, removed = verification_observation(
+            api.observe(), active_geometry, max(source[2], destination[2]))
+        verification_filter = {"before_excluded_pixels": removed,
+                               "before_model": active_geometry["status"]}
         baseline = None
+        baselines = None
         if color == "surface":
             support = clearance_report["support_z"]
             baseline = visible_cloud(before_observation, camera, color, source[:2], radius,
@@ -953,10 +1286,37 @@ def run(api, command, args):
             before = float(np.quantile(baseline[:, 2], .95))
             if not surface_lift(baseline, baseline+[0., 0., .04], .04)["verified"]:
                 return failure("ambiguous_surface_baseline", "insufficient distinct distributed depth evidence")
+            baselines = depth_baselines(before_observation, camera, source[:2], radius,
+                                        support, baseline)
         else:
             before = visible_top(before_observation, camera, color, source[:2], radius)
         initial = arm.tcp().copy()
         rotation = tool_rotation(approach, opening, initial[:3, :3])
+        grasp_height = grasp_height_report(arm, rotation, source[2], before)
+        if grasp_height is not None and not grasp_height["height_compatible"]:
+            # Mark as preflight so auto may check the other finger orientation,
+            # but never lower a caller's endpoint or physically retry it.
+            phase = "preflight"
+            return failure("grasp_above_visible_surface", "Finger reach does not overlap observed top; see grasp_height for the TCP height bound.")
+        if grasp_height is not None:
+            # Scene clouds deliberately omit the support plane and the source
+            # footprint. They cannot protect fingers below that plane, notably
+            # after auto changes a vertical TCP request to a tilted orientation.
+            # Bound the entire opening sweep at BOTH low endpoints: closing and
+            # opening can otherwise lever the payload against the support.
+            support = clearance_report["support_z"]
+            lowest_offset = grasp_height["finger_lowest_z_bound"] - source[2]
+            minimum_tcp_z = support + .002 - lowest_offset
+            destination_bottom = float(destination[2] + lowest_offset)
+            support_ok = bool(min(source[2], destination[2]) >= minimum_tcp_z)
+            grasp_height.update(support_z=float(support),
+                                minimum_tcp_z=float(minimum_tcp_z),
+                                destination_finger_lowest_z_bound=destination_bottom,
+                                support_compatible=support_ok)
+            if not support_ok:
+                phase = "preflight"
+                return failure("fingers_intersect_support",
+                               "Full finger opening sweep intersects measured support at grasp or release; see grasp_height.minimum_tcp_z. Endpoints were not changed.")
 
         def move(name, xyz, orient):
             nonlocal phase
@@ -978,6 +1338,10 @@ def run(api, command, args):
 
         phase = "preflight"
         attempts = []
+        approach_cache = {}
+        descent_cache = {}
+        hand_cache = {}
+        transfer_cache = {}
         feasible = False
         for candidate in route_reports:
             clearance_report = candidate
@@ -1064,27 +1428,50 @@ def run(api, command, args):
                          or preflight.get("failed_stage") not in
                          ("orient", "approach", "approach_station"))):
                     continue
-                hand_check = opposite_hand_clearance(api, arm, approach_targets + suffix)
-                scene_check = descent_scene_clearance(
-                    before_observation, args, arm, source, rotation, approach_targets[-1][1][2],
-                    candidate["support_z"], active_geometry)
+                hand_check = cached_hand_clearance(api, arm, approach_targets + suffix, hand_cache)
+                # Source, orientation, arguments, cloud and measured arm are
+                # fixed for this invocation. Only support and approach height
+                # vary between descent checks; no cache survives this call.
+                descent_key = (float(candidate["support_z"]), float(approach_targets[-1][1][2]))
+                if descent_key not in descent_cache:
+                    descent_cache[descent_key] = descent_scene_clearance(
+                        before_observation, args, arm, source, rotation, descent_key[1],
+                        candidate["support_z"], active_geometry)
+                scene_check = descent_cache[descent_key]
                 # Default departure rotations need the same depth guard as
                 # alternate stations. For a separate approach, its final
                 # fixed-orientation translation retains the measured top-height
                 # guard; the axis capsule would falsely extend below fingertips.
                 sweep_targets = (approach_targets[:-1] if approach_profile == "separate"
                                  else approach_targets)
-                approach_check = approach_scene_clearance(
-                    api, before_observation, args, arm, sweep_targets,
-                    candidate["support_z"], active_geometry)
+                # Carry profiles often share an identical empty-hand approach.
+                # Cache only within this call's immutable observation/arm pose.
+                approach_key = (float(candidate["support_z"]), tuple(
+                    (name, tuple(np.asarray(xyz)), tuple(np.asarray(orient).ravel()))
+                    for name, xyz, orient in sweep_targets))
+                if approach_key not in approach_cache:
+                    approach_cache[approach_key] = approach_scene_clearance(
+                        api, before_observation, args, arm, sweep_targets,
+                        candidate["support_z"], active_geometry)
+                approach_check = approach_cache[approach_key]
                 if not approach_check["plan_ok"]:
                     approach_obstructed |= approach_check.get("plan_fail_reason") == "scene_in_approach_path"
                     preflight = dict(approach_check)
                     attempts.append(dict(approach_check, approach_profile=approach_profile))
                     continue
+                transfer_key = (float(candidate["support_z"]), tuple(
+                    (name, tuple(xyz)) for name, xyz, _ in suffix[1:]))
+                if transfer_key not in transfer_cache:
+                    transfer_cache[transfer_key] = transfer_scene_clearance(
+                        before_observation, args, arm, source, rotation,
+                        candidate["support_z"], active_geometry,
+                        suffix=[(name, xyz) for name, xyz, _ in suffix[1:]])
+                transfer_check = transfer_cache[transfer_key]
+                obstruction = next((check for check in (hand_check, scene_check, transfer_check)
+                                    if not check["plan_ok"]), None)
                 preflight = (preflight_path(api, arm, approach_targets + suffix)
-                             if hand_check["plan_ok"] and scene_check["plan_ok"]
-                             else dict(hand_check if not hand_check["plan_ok"] else scene_check))
+                             if obstruction is None else dict(obstruction))
+                preflight["transfer_scene_check"] = transfer_check
                 preflight["approach_scene_check"] = approach_check
                 preflight["descent_scene_check"] = scene_check
                 if hand_check["plan_ok"]:
@@ -1104,9 +1491,50 @@ def run(api, command, args):
                 break
         if preflight is None:
             preflight = {"plan_ok": False, "plan_fail_reason": "clearance_exceeds_limit"}
-        preflight["route_attempts"] = attempts
+        # Preserve distinct evidence, with counts for repeated rejections.
+        unique_attempts = {}
+        for attempt in attempts:
+            attempt = dict(attempt)
+            if (attempt.get("plan_fail_reason") in (
+                    "scene_in_approach_path", "scene_in_descent_path", "opposite_hand_in_path")
+                    and attempt.get("failed_stage") in (
+                        "raise", "orient", "approach_station", "approach", "descend")):
+                # The carry was never reached. Preserve collision evidence and
+                # approach identity, but don't repeat it for every carry path.
+                for field in ("route", "height_profile", "carry_waypoints_xy"):
+                    attempt.pop(field, None)
+            key = json.dumps(attempt, sort_keys=True, default=lambda value: value.tolist())
+            if key in unique_attempts:
+                unique_attempts[key]["occurrences"] += 1
+            else:
+                unique_attempts[key] = dict(attempt, occurrences=1)
+        preflight["route_attempts"] = list(unique_attempts.values())
+        preflight["attempt_count"] = len(attempts)
         if not feasible:
+            # A scene rejection previously hid all reach evidence. Report one
+            # independently checked full chain, without treating it as clearance
+            # or as proof that every alternative is unreachable.
+            if preflight.get("plan_fail_reason") in (
+                    "scene_in_approach_path", "scene_in_descent_path", "scene_in_transfer_path", "opposite_hand_in_path"):
+                try:
+                    diagnostic = preflight_path(api, arm, approach_targets + suffix)
+                except Exception as exc:
+                    diagnostic = dict(plan_ok=False, plan_fail_reason="kinematics_unavailable",
+                                      detail=str(exc))
+                preflight["diagnostic_kinematics"] = dict(diagnostic,
+                    approach_profile=approach_profile,
+                    scope="last candidate only; does not override collision rejection")
             return failure(preflight["plan_fail_reason"], preflight)
+        if planning_only:
+            return {"plan_ok": True, "plan_fail_reason": None,
+                    "planning_only": True, "preflight": preflight,
+                    "grasp_height": grasp_height,
+                    "verification_filter": verification_filter,
+                    "clearance_report": clearance_report, "withdraw_z": float(withdraw_z),
+                    "stages": [], "grip_command_closed": False, "released": False,
+                    "visual_lift_verified": False, "placement_verified": False,
+                    "limitation": "Current observation only; execution recomputes all checks. "
+                                  "Occluded geometry, contact and tracking remain unverified."}, 0
         for name, xyz, orient in targets:
             if pose_is_noop(arm.tcp(), xyz, orient):
                 continue
@@ -1123,7 +1551,11 @@ def run(api, command, args):
         if result:
             return result
         phase = "verify_lift"
-        after_observation = api.observe()
+        after_geometry = active_arm_geometry(api, arm)
+        after_observation, removed = verification_observation(
+            api.observe(), after_geometry, travel_z)
+        verification_filter.update(after_excluded_pixels=removed,
+                                   after_model=after_geometry["status"])
         expected = travel_z-source[2]
         after = None
         visibility_error = None
@@ -1140,7 +1572,7 @@ def run(api, command, args):
             # A rising top never suffices: every accepted view must register
             # the pre-motion above-support cloud under the expected translation.
             evidence = depth_lift(baseline, after_observation, camera, source[:2], radius,
-                                  expected, clearance_report["support_z"])
+                                  expected, clearance_report["support_z"], baselines)
             lift_measurement["depth_surface_match"] = evidence
             verified = evidence["verified"]
         elif rise is None or rise < .5*expected:
@@ -1157,6 +1589,14 @@ def run(api, command, args):
                 visible_cloud(after_observation, camera, color, source[:2], radius), expected)
             lift_measurement["surface_match"] = evidence
             verified = evidence["verified"]
+            if not verified:
+                # Excessive apparent rise can hide a real lift just as a low
+                # or missing top can. Require the same translated-surface
+                # evidence from another calibrated view before continuing.
+                evidence = alternate_lift(before_observation, after_observation,
+                                          camera, color, source[:2], radius, expected)
+                lift_measurement["alternate_views"] = evidence
+                verified = evidence["verified"]
         if not verified:
             return failure("lift_not_verified", f"observed rise {rise!r} m; expected {expected:.4f} m")
         lifted = True
@@ -1173,7 +1613,9 @@ def run(api, command, args):
         if result:
             return result
         return {"plan_ok": True, "plan_fail_reason": None, "stages": stages,
+                "grasp_height": grasp_height,
                 "visual_lift_verified": True, "observed_rise_m": rise, "released": True,
+                "verification_filter": verification_filter,
                 "lift_measurement": lift_measurement, "withdraw_z": float(withdraw_z),
                 "preflight": preflight, "clearance_report": clearance_report, "placement_verified": False, "reached_tcp": arm.tcp()[:3, 3].tolist()}, 0
     except Exception as exc:

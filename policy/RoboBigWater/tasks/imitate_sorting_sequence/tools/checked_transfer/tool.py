@@ -20,6 +20,8 @@ TOOL = {"name": "checked_transfer", "commands": [{
         {"name": "approach", "default": "down", "choices": ["down", "down45"]},
         {"name": "yaw", "type": "float", "default": 0.0},
         {"name": "clearance", "type": "float", "default": 0.10},
+        {"name": "release_above", "type": "float", "default": 0.04},
+        {"name": "landing_floor_z", "type": "float", "default": None},
         {"name": "via", "default": ""},
     ]}]}
 
@@ -42,39 +44,71 @@ TOOL["commands"].append({"name": "roi-check", "budget": False,
     "args": [a.copy() for a in TOOL["commands"][-1]["args"]]})
 
 
-# Robot handles are episode-local. Weak keys prevent readiness leaking across
-# resets or retaining old episodes; values contain only public API readings.
-# A completed transfer establishes initialization, not current stillness. Base
-# motions may change poses/time; every next transfer checks fresh full-frame
-# settling and refits geometry. A clock rewind or changed handles rejects it.
-_completed_transfers = weakref.WeakKeyDictionary()
+# Use the same tool-owned initialization evidence as guarded rotations.
+# Only public robot handles and clocks enter this weak, episode-local cache.
+_visual_path = Path(__file__).resolve().parents[1] / "vision_checks" / "tool.py"
+_visual_spec = importlib.util.spec_from_file_location("transfer_visual_gate", _visual_path)
+_visual_module = importlib.util.module_from_spec(_visual_spec)
+_visual_spec.loader.exec_module(_visual_module)
+_completed_transfers = _visual_module._completed_transfers
+continuation_ready = _visual_module.continuation_ready
+_failed_poses = weakref.WeakKeyDictionary()
 
 
-def continuation_ready(api):
+def failed_poses(api, arm):
+    """Only measured tool failures, scoped to live handles and a monotone clock."""
     try:
-        left, right = api.arm("left"), api.arm("right")
-        saved = _completed_transfers.get(left)
-        return bool(not api.over and saved and saved[0]() is right
-                    and math.isfinite(api.sim_time_left())
-                    and 0 <= api.sim_time_left() <= saved[1] + 1e-8)
+        now = api.sim_time_left()
+        saved = _failed_poses.get(arm)
+        peer = api.arm("right" if arm is api.arm("left") else "left")
+        if (saved and saved[0]() is peer and math.isfinite(now)
+                and 0 <= now <= saved[1] and not api.over):
+            _failed_poses[arm] = (saved[0], now, saved[2])
+            return saved[2]
+        _failed_poses.pop(arm, None)
     except Exception:
-        return False
+        pass
+    return []
+
+
+def remember_failure(api, arm, name, pose):
+    if name not in ("rotate", "above", "descend"):
+        return
+    try:
+        rows = list(failed_poses(api, arm))
+        rows.append((name, pose.copy()))
+        peer = api.arm("right" if arm is api.arm("left") else "left")
+        _failed_poses[arm] = (weakref.ref(peer), api.sim_time_left(), rows[-16:])
+    except Exception:
+        pass
+
+
+def budget_ok(api, preview, include_gate):
+    remaining = max(0, int(api.sim_time_left() * 25))
+    gate_steps = (10 if continuation_ready(api) else 50) if include_gate else 0
+    required = int(preview["transfer_action_steps"]) + gate_steps + 150
+    preview.update(home_reserve_steps=150, required_action_steps=required,
+                   remaining_action_steps=remaining, budget_ok=remaining >= required)
+    return remaining >= required
 
 
 def visual_gate(api):
-    # Load the sibling task tool, not the registry or any episode internals.
-    path = Path(__file__).resolve().parents[1] / "vision_checks" / "tool.py"
-    spec = importlib.util.spec_from_file_location("transfer_visual_gate", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
     continuation = continuation_ready(api)
-    # Consume before waiting: failures cannot authorize another short gate.
+    # A failed quietness check invalidates initialization. A later manipulation
+    # failure does not erase a completed quiet interval; the next call must
+    # still pass a fresh full-image settling check before it can move.
     try:
         _completed_transfers.pop(api.arm("left"), None)
     except TypeError:
         pass
-    report, code = module.run(api, "wait-still", {
+    report, code = _visual_module.run(api, "wait-still", {
         "camera": "head", "quiet": .4 if continuation else 2, "timeout": 6})
+    if not code and report.get("plan_ok") and not api.over:
+        try:
+            _completed_transfers[api.arm("left")] = (
+                weakref.ref(api.arm("right")), api.sim_time_left())
+        except Exception:
+            pass
     report["gate_mode"] = "continuation_settling" if continuation else "full_quietness"
     return report, code
 
@@ -170,6 +204,76 @@ def grasp_geometry(obs, roi, floor):
                 caveat="Visible bounds and the supplied plane only; occlusion, hollow or flexible shapes can invalidate this pinch estimate.")
 
 
+def receiving_plane_check(points, valid, lo, hi, height):
+    """Require distributed visible plane evidence, not one elevated depth ray."""
+    width = hi - lo
+    fractions = (np.arange(5) + .5) / 5
+    x, y = np.meshgrid(lo[0] + fractions * width[0], lo[1] + fractions * width[1])
+    samples = np.column_stack([x.ravel(), y.ravel()])
+    # Separate neighborhoods prevent one small patch from voting for the
+    # whole footprint. Missing depth and occlusion supply no positive vote.
+    radius = np.minimum(.008, width * .08)
+    near_plane = points[valid & (np.abs(points[:, :, 2] - height) <= .004)]
+    covered = np.zeros(25, dtype=bool)
+    for i, xy in enumerate(samples):
+        covered[i] = np.any(np.all(np.abs(near_plane[:, :2] - xy) <= radius, axis=1))
+    confirmed = bool(covered.sum() >= 20 and covered[[0, 4, 12, 20, 24]].all())
+    return dict(confirmed=confirmed, covered_samples=int(covered.sum()), total_samples=25,
+                sample_xy=samples.tolist(), covered=covered.tolist(),
+                height_tolerance_m=.004, neighborhood_xy_m=radius.tolist())
+
+
+def destination_check(obs, reference, goal, dest, floor, geometry=None, release_above=0.,
+                      landing_floor_z=None, cloud_data=None):
+    """Reject visible raised surfaces in the translated solid footprint.
+
+    This checks the falling volume down to an independently specified plane.
+    Missing/occluded geometry is not evidence of a clear landing. Bounds are
+    conservative for hollow shapes; no semantic destination inference is made.
+    """
+    if geometry is not None:
+        lower, upper = np.asarray(geometry["visible_bounds"], dtype=float)
+    else:
+        lower, upper = np.min(reference, axis=0), np.max(reference, axis=0)
+    lo = dest[:2] + lower[:2] - goal[:2] - .005
+    hi = dest[:2] + upper[:2] - goal[:2] + .005
+    # Release height is not a landing plane. Raising either to_z or
+    # release_above must never remove obstacles below the release volume.
+    # A different receiving plane must be supplied independently in world z.
+    bottom = dest[2] + floor - goal[2]
+    top = dest[2] + upper[2] - goal[2]
+    landing_floor = floor if landing_floor_z is None else float(landing_floor_z)
+    if not math.isfinite(landing_floor) or landing_floor > bottom + .010:
+        raise ValueError("invalid_landing_floor_z")
+    swept_bottom = min(bottom, landing_floor)
+    points, _, valid = cloud(obs) if cloud_data is None else cloud_data
+    # Only a plane that materially raises the obstruction sweep needs this
+    # additional evidence. Same/lower planes retain the conservative sweep.
+    plane_check = None
+    if swept_bottom > floor + .010:
+        plane_check = receiving_plane_check(points, valid, lo + .005, hi - .005,
+                                            landing_floor)
+    mask = (valid & np.all(points[:, :, :2] >= lo, axis=2)
+            & np.all(points[:, :, :2] <= hi, axis=2)
+            & (points[:, :, 2] > swept_bottom + .010)
+            & (points[:, :, 2] <= top + release_above + .010))
+    # Count occupied 3 mm world cells, not camera pixels: a single noisy
+    # depth ray or a tiny raster cluster must not veto a transfer.
+    hits = points[mask]
+    cells = len(np.unique(np.floor(hits / .003).astype(np.int64), axis=0))
+    blocked = cells >= 6
+    return dict(clear_of_visible_obstructions=not blocked,
+                receiving_plane_check=plane_check,
+                receiving_plane_ok=plane_check is None or plane_check["confirmed"],
+                occupied_cells=cells, footprint_xy=[lo.tolist(), hi.tolist()],
+                nominal_bottom_z=float(bottom), nominal_top_z=float(top),
+                landing_floor_z=float(landing_floor), swept_bottom_z=float(swept_bottom),
+                obstruction_bounds=([hits.min(axis=0).tolist(), hits.max(axis=0).tolist()]
+                                    if len(hits) else None),
+                landing_verified=False,
+                caveat="Head depth only; hidden surfaces, bounce and hollow shapes remain uncertain.")
+
+
 def vertical_candidates(xy):
     """Narrow planar PCA axis, nearby headings, and both symmetric finger signs."""
     xy = np.asarray(xy, dtype=float)
@@ -209,7 +313,7 @@ def vertical_rotation(yaw, tilt=0.):
     return np.stack([down, across, np.cross(down, across)], axis=1)
 
 
-def fit_route(api, arm, geometry, goal, dest, clearance, via):
+def fit_route(api, arm, geometry, goal, dest, clearance, via, release_above=0.):
     """Read-only bounded search; never attempt an infeasible candidate physically."""
     initial = arm.tcp()
     attempts = []
@@ -219,25 +323,33 @@ def fit_route(api, arm, geometry, goal, dest, clearance, via):
         c["visible_width_m"], -np.trace(initial[:3, :3].T @ vertical_rotation(c["yaw_deg"]))))
     if not candidates:
         raise ValueError("no_grasp_candidates")
-    # Exhaust vertical solutions first, then modest and larger tilts. This is
-    # at most 50 motionless checks, never a physical retry. Width filtering and
-    # both symmetric finger orientations from the geometry fit are preserved.
-    for tilt in (0., 30., -30., 45., -45.):
-        for candidate in candidates:
-            rotation = vertical_rotation(candidate["yaw_deg"], tilt)
-            choice = dict(candidate, tilt_deg=tilt,
-                          approach="down" if tilt == 0 else "tilted_level_fingers",
-                          approach_direction=rotation[:, 0].tolist(),
-                          closing_direction=rotation[:, 1].tolist())
-            route = transfer_route(initial, goal, dest, clearance, via, "down", "x",
-                                   rotation=rotation)
-            report = preflight(api, arm, route)
-            attempts.append(dict(**choice, estimate_ok=bool(report.get("estimate_ok")),
-                                 reason=report.get("reason"), failed_stage=report.get("failed_stage")))
-            if report.get("estimate_ok"):
-                report["selected_grasp"] = choice
-                report["candidate_checks"] = attempts
-                return route, report
+    # Compare both signs at a given absolute tilt, including a combined
+    # elevated translation/rotation. Every candidate gets full-route IK.
+    for tilts in ((0.,), (30., -30.), (45., -45.)):
+        feasible = []
+        for tilt in tilts:
+            for setup in ("rotate_first", "translate_first", "combined"):
+                for candidate in candidates:
+                    rotation = vertical_rotation(candidate["yaw_deg"], tilt)
+                    choice = dict(candidate, tilt_deg=tilt, setup=setup,
+                                  approach="down" if tilt == 0 else "tilted_level_fingers",
+                                  approach_direction=rotation[:, 0].tolist(),
+                                  closing_direction=rotation[:, 1].tolist())
+                    route = transfer_route(initial, goal, dest, clearance, via, "down", "x",
+                                           rotation=rotation, release_above=release_above,
+                                           setup=setup)
+                    report = preflight(api, arm, route)
+                    attempts.append(dict(**choice, estimate_ok=bool(report.get("estimate_ok")),
+                                         reason=report.get("reason"), failed_stage=report.get("failed_stage")))
+                    if report.get("estimate_ok"):
+                        feasible.append((route, report, choice))
+        if feasible:
+            # Compare costs within the least-tilted feasible tier. This is free
+            # IK work, not another physical attempt or a cached executable plan.
+            route, report, choice = min(feasible, key=lambda r: r[1]["transfer_action_steps"])
+            report["selected_grasp"] = choice
+            report["candidate_checks"] = attempts
+            return route, report
     report["candidate_checks"] = attempts
     return route, report
 
@@ -288,6 +400,43 @@ def occluded_reference(obs, expected):
     return hidden
 
 
+def source_consistency(obs, points, valid, reference):
+    """Exclude alternate-view source samples inside head-camera free space.
+
+    A nearby RGB match is not a surface if another calibrated camera sees
+    beyond it. Require all nine neighboring depth rays to agree, with a 5 mm
+    margin. Occlusion, missing depth and image edges cannot clear a sample.
+    Only the source neighborhood is projected, bounding work and memory.
+    """
+    lower, upper = reference.min(axis=0) - .015, reference.max(axis=0) + .015
+    selected = valid & np.all((points >= lower) & (points <= upper), axis=2)
+    rows, cols = np.nonzero(selected)
+    if not len(rows):
+        return valid, 0
+    model = obs['cameras']['cam_head']
+    depth = np.asarray(obs['depth']['cam_head'], dtype=float)
+    xyz = points[rows, cols]
+    camera = np.linalg.solve(np.asarray(model['extrinsics_world'], dtype=float),
+                             np.vstack([xyz.T, np.ones(len(xyz))]))
+    camera = camera[:3] / camera[3]
+    projected = np.asarray(model['intrinsics'], dtype=float) @ camera
+    usable = (camera[2] > 0) & np.isfinite(projected).all(axis=0)
+    indices = np.flatnonzero(usable)
+    uv = np.rint(projected[:2, indices] / projected[2, indices]).T
+    inside = ((uv[:, 0] >= 1) & (uv[:, 0] < depth.shape[1] - 1)
+              & (uv[:, 1] >= 1) & (uv[:, 1] < depth.shape[0] - 1))
+    indices, uv = indices[inside], uv[inside].astype(int)
+    clear = np.ones(len(indices), dtype=bool)
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            measured = depth[uv[:, 1] + dy, uv[:, 0] + dx]
+            clear &= np.isfinite(measured) & (measured > 0) & (measured > camera[2, indices] + .005)
+    rejected = indices[clear]
+    filtered = valid.copy()
+    filtered[rows[rejected], cols[rejected]] = False
+    return filtered, int(len(rejected))
+
+
 def evidence(obs, reference, appearance, delta, floor_z=None):
     # Use the same above-plane predicate as template extraction. A 15 mm
     # positional match alone mistakes the exposed plane under thin surfaces
@@ -302,6 +451,7 @@ def evidence(obs, reference, appearance, delta, floor_z=None):
     original = source_fraction(points, colors, valid)
     cameras = {"cam_head": float(matched.mean())}
     source_cameras = {"cam_head": original}
+    source_conflicts = {}
     skipped = {}
     # References remain in world coordinates. A second calibrated view may
     # reveal the same surface behind the fingers, without moving either arm.
@@ -310,14 +460,16 @@ def evidence(obs, reference, appearance, delta, floor_z=None):
         try:
             p, c, v = cloud(obs, camera)
             votes = matching_mask(p, c, v, reference, appearance, delta)
-            source = source_fraction(p, c, v)
+            source_valid, conflicts = source_consistency(obs, p, v, reference)
+            source = source_fraction(p, c, source_valid)
         except Exception as exc:
             skipped[camera] = str(exc) or "invalid_camera"
             continue
         cameras[camera] = float(votes.mean())
         source_cameras[camera] = source
+        source_conflicts[camera] = conflicts
         matched |= votes
-        # A source still visible in ANY view vetoes an apparent lifted match.
+        # A geometrically consistent source in ANY view can veto a lift.
         original = max(original, source)
     moved = float(matched.mean()) if len(matched) else 0.0
     visible = ~occluded_reference(obs, reference + delta)
@@ -335,6 +487,7 @@ def evidence(obs, reference, appearance, delta, floor_z=None):
     confirmed = moved >= .45 or (enough and moved >= .30 and visible_match >= .60)
     return {"translated_surface_fraction": moved, "original_surface_fraction": original,
             "camera_source_fractions": source_cameras, "source_floor_z": floor_z,
+            "camera_source_conflicts": source_conflicts,
             "camera_match_fractions": cameras, "skipped_cameras": skipped,
             "visible_reference_count": count,
             "evidence_reference_count": evidence_count,
@@ -344,7 +497,8 @@ def evidence(obs, reference, appearance, delta, floor_z=None):
             "visual_lift_evidence": bool(confirmed and original <= 0.35)}
 
 
-def transfer_route(initial, goal, dest, clearance, via, approach, axis, yaw=0., rotation=None):
+def transfer_route(initial, goal, dest, clearance, via, approach, axis, yaw=0., rotation=None,
+                   release_above=0., setup="rotate_first"):
     """Exact nominal motion targets shared by preview and execution."""
     from roboshell.server.core import tool_rotation
     target = np.asarray(initial, dtype=float).copy()
@@ -361,24 +515,41 @@ def transfer_route(initial, goal, dest, clearance, via, approach, axis, yaw=0., 
         rz = np.array([[math.cos(angle), -math.sin(angle), 0.],
                        [math.sin(angle), math.cos(angle), 0.], [0., 0., 1.]])
         rotation = rz @ tool_rotation(approach, axis, target[:3, :3])
-    target[:3, :3] = rotation
-    add("rotate")
-    target[:3, 3] = [goal[0], goal[1], cruise]
-    add("above")
+    if setup == "combined":
+        # Both ends are at or above cruise; rotation finishes before descent.
+        target[:3, 3] = [goal[0], goal[1], cruise]
+        target[:3, :3] = rotation
+        add("rotate")
+    elif setup == "translate_first":
+        target[:3, 3] = [goal[0], goal[1], cruise]
+        add("above")
+        target[:3, :3] = rotation
+        add("rotate")
+    elif setup == "rotate_first":
+        target[:3, :3] = rotation
+        add("rotate")
+        target[:3, 3] = [goal[0], goal[1], cruise]
+        add("above")
+    else:
+        raise ValueError("invalid_setup")
     target[:3, 3] = goal
     add("descend")
     target[2, 3] = cruise
     add("lift")
     waypoints = ([np.array([*via, cruise])] if via else []) + [np.array([dest[0], dest[1], cruise])]
     for waypoint in waypoints:
-        origin = target[:3, 3].copy()
-        count = max(1, math.ceil(np.linalg.norm(waypoint - origin) / .15))
-        if count > 20:
+        if np.linalg.norm(waypoint - target[:3, 3]) > 3.0:
             raise ValueError("transfer_too_long")
-        for i in range(1, count + 1):
-            target[:3, 3] = origin + (waypoint - origin) * i / count
-            add("carry")
+        # move_tcp already solves the entire straight line at ~2 cm intervals.
+        # Splitting it into 15 cm commands adds a full deceleration/acceleration
+        # at every boundary without changing clearance or the geometric path.
+        # Keep caller-specified bends, but check retention only at each endpoint.
+        target[:3, 3] = waypoint
+        add("carry")
     target[:3, 3] = dest
+    # Shorten only the final descent, never raise the entire carry path.
+    # The caller can request exact-height release with a zero allowance.
+    target[2, 3] += release_above
     add("lower")
     target[2, 3] = cruise
     add("retreat")
@@ -386,6 +557,13 @@ def transfer_route(initial, goal, dest, clearance, via, approach, axis, yaw=0., 
 
 
 def preflight(api, arm, route):
+    for name, pose in route:
+        for failed_name, failed_pose in failed_poses(api, arm):
+            cosine = np.clip((np.trace(pose[:3, :3].T @ failed_pose[:3, :3])-1)/2, -1, 1)
+            if (name == failed_name and np.linalg.norm(pose[:3, 3]-failed_pose[:3, 3]) < .025
+                    and np.degrees(np.arccos(cosine)) < 10):
+                return dict(estimate_ok=False, reason="previous_tracking_failure",
+                            failed_stage=name, estimate_only=True)
     report = dict(api.estimate_tcp_chain(arm, route))
     # The API counts close/release; this tool also opens before approach.
     if report.get("estimate_ok"):
@@ -406,11 +584,11 @@ def run(api, command, args):
     start = None
     geometry = None
     preview = None
+    destination = None
     def result(reason=None):
         # A rejected read-only fit/preflight has not disturbed the scene.
-        # Preserve initialization only for the same live robot handles
-        # with a finite, non-rewound clock. visual_gate consumes it before any hold/motion,
-        # so gate failures and all subsequent execution failures invalidate it.
+        # Initialization records successful quietness, not grasp success.
+        # Failed gates invalidate it; subsequent manipulation errors do not.
         if (reason is not None and command in ("grasp-transfer", "roi-transfer")
                 and not continuation_ready(api)):
             try:
@@ -419,7 +597,8 @@ def run(api, command, args):
                 pass
         out = dict(plan_ok=reason is None, plan_fail_reason=reason, stages=stages,
                    visual_checks=checks, released=any(s["stage"] == "release" for s in stages),
-                   holding_verified=False, visual_gate=gate, grasp_geometry=geometry, preflight=preview)
+                   holding_verified=False, visual_gate=gate, grasp_geometry=geometry, preflight=preview,
+                   destination_check=destination)
         if start is not None:
             out["action_steps"] = max(0, round((start - api.sim_time_left()) * 25))
         return out, 0 if reason is None else 2
@@ -440,12 +619,19 @@ def run(api, command, args):
         dest = np.array([float(args[k]) for k in ("to_x", "to_y", "to_z")])
         yaw = float(args.get("yaw", 0.))
         floor, clearance = float(args["floor_z"]), float(args.get("clearance", 0.10))
+        release_above = float(args.get("release_above", .04))
+        landing_floor_z = args.get("landing_floor_z")
+        if landing_floor_z is not None:
+            landing_floor_z = float(landing_floor_z)
+            if not math.isfinite(landing_floor_z):
+                return result("invalid_landing_floor_z")
         roi = tuple(int(v) for v in args["roi"].split(","))
         via = [float(v) for v in args.get("via", "").split(",")] if args.get("via") else []
         tag, approach, axis = args["arm"], args.get("approach", "down"), args.get("open", "x")
         if (tag not in ("left", "right") or approach not in ("down", "down45") or axis not in ("x", "y")
                 or len(roi) != 4 or len(via) not in (0, 2)
-                or not np.isfinite([*goal, *dest, floor, clearance, yaw, *via]).all()
+                or not np.isfinite([*goal, *dest, floor, clearance, release_above, yaw, *via]).all()
+                or not 0 <= release_above <= min(.06, clearance)
                 or not 0.06 <= clearance <= 0.18 or not floor < goal[2] or dest[2] <= floor):
             return result("invalid_arguments")
         if api.over:
@@ -453,14 +639,23 @@ def run(api, command, args):
         reference, appearance = template(api.observe(), roi, goal, floor)
         arm = api.arm(tag)
         start = api.sim_time_left()
+        destination = destination_check(api.observe(), reference, goal, dest, floor, geometry,
+                                        release_above, landing_floor_z)
+        if not destination["clear_of_visible_obstructions"]:
+            return result("destination_obstructed")
+        if not destination.get("receiving_plane_ok", True):
+            return result("landing_plane_unconfirmed")
         def checked_route():
             if command in ("roi-transfer", "roi-check"):
-                return fit_route(api, arm, geometry, goal, dest, clearance, via)
-            route = transfer_route(arm.tcp(), goal, dest, clearance, via, approach, axis, yaw)
+                return fit_route(api, arm, geometry, goal, dest, clearance, via, release_above)
+            route = transfer_route(arm.tcp(), goal, dest, clearance, via, approach, axis, yaw,
+                                   release_above=release_above)
             return route, preflight(api, arm, route)
         route, preview = checked_route()
         if not preview.get("estimate_ok"):
             return result("preflight_" + (preview.get("reason") or "unreachable"))
+        if not budget_ok(api, preview, include_gate=True):
+            return result("insufficient_steps_with_home_reserve")
         if command in ("transfer-check", "roi-check"):
             return result()
         gate, code = visual_gate(api)
@@ -474,9 +669,17 @@ def run(api, command, args):
             goal = np.array(geometry["grasp_xyz"])
             axis = geometry["open"]
         reference, appearance = template(api.observe(), roi, goal, floor)
+        destination = destination_check(api.observe(), reference, goal, dest, floor, geometry,
+                                        release_above, landing_floor_z)
+        if not destination["clear_of_visible_obstructions"]:
+            return result("destination_obstructed")
+        if not destination.get("receiving_plane_ok", True):
+            return result("landing_plane_unconfirmed")
         route, preview = checked_route()
         if not preview.get("estimate_ok"):
             return result("preflight_" + (preview.get("reason") or "unreachable"))
+        if not budget_ok(api, preview, include_gate=False):
+            return result("insufficient_steps_with_home_reserve")
 
         def move(name, pose):
             if api.over:
@@ -494,6 +697,7 @@ def run(api, command, args):
             if code or not feedback.get("plan_ok"):
                 raise ValueError(feedback.get("plan_fail_reason") or "motion_failed")
             if feedback.get("workspace_limited") or not math.isfinite(error) or not math.isfinite(angle) or angle > 5:
+                remember_failure(api, arm, name, desired)
                 raise ValueError("motion_tracking_error")
             if error > 0.012:
                 offset = reached[:3, 3] - desired[:3, 3]
@@ -501,7 +705,8 @@ def run(api, command, args):
                 # Never excuse lateral drift, overshoot, earlier route errors,
                 # or a shortfall exceeding half the requested clearance.
                 if (name != "lower" or np.linalg.norm(offset[:2]) > .012
-                        or not 0 < offset[2] <= min(.04, clearance / 2)):
+                        or not 0 < offset[2] <= min(.04, clearance / 2) - release_above):
+                    remember_failure(api, arm, name, desired)
                     raise ValueError("motion_tracking_error")
                 return reached.copy()
             return None
@@ -530,6 +735,9 @@ def run(api, command, args):
             elif name in ("lift", "carry"):
                 check()
             elif name == "lower":
+                stages[-1]["release_above_m"] = release_above
+                if release_above > 0:
+                    check()
                 if elevated_release is not None:
                     # Reconfirm retention at the actual pose before opening.
                     check()

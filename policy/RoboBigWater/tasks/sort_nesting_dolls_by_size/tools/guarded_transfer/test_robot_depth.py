@@ -355,12 +355,14 @@ class RobotDepthTest(unittest.TestCase):
             self.assertIn('wrist_pose', active_arm_geometry(api, api.robot))
             self.assertIn('link4_pose', active_arm_geometry(api, api.robot))
             self.assertIn('link3_pose', active_arm_geometry(api, api.robot))
+            self.assertIn('link2_pose', active_arm_geometry(api, api.robot))
             self.assertIn('camera_ee', active_arm_geometry(api, api.robot))
         for bad in ([0]*5, [0]*5+[np.nan]):
             api.robot.joints = lambda: bad
             self.assertNotIn('wrist_pose', active_arm_geometry(api, api.robot))
             self.assertNotIn('link4_pose', active_arm_geometry(api, api.robot))
             self.assertNotIn('link3_pose', active_arm_geometry(api, api.robot))
+            self.assertNotIn('link2_pose', active_arm_geometry(api, api.robot))
         api.robot.joints = lambda: np.zeros(6)
         api.robot.gripper = lambda: 1.
         api.robot.tcp_to_ee[0, 3] = -.3
@@ -369,6 +371,7 @@ class RobotDepthTest(unittest.TestCase):
         self.assertNotIn('camera_ee', active_arm_geometry(api, api.robot))
         self.assertNotIn('link4_pose', active_arm_geometry(api, api.robot))
         self.assertNotIn('link3_pose', active_arm_geometry(api, api.robot))
+        self.assertNotIn('link2_pose', active_arm_geometry(api, api.robot))
 
     def test_fk_spheres_calibrate_rotation_translation_and_bias(self):
         for angle in (0., .8):

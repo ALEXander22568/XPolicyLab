@@ -2,7 +2,7 @@
 import unittest
 import numpy as np
 import cv2
-from tool import measure, run
+from tool import measure, run, surface_labels
 
 
 def scene(centers, support):
@@ -29,6 +29,42 @@ def scene(centers, support):
 
 
 class GeometryTest(unittest.TestCase):
+    def test_projected_neighbors_require_metric_continuity(self):
+        v, u = np.indices((20, 30))
+        points = np.stack((u*.002, v*.002, np.zeros_like(u)), -1)
+        points[:, 15:, 2] += .08
+        mask = np.ones((20, 30), bool)
+        for shift in ([0., 0., 0.], [.3, -.2, .7]):
+            count, labels = surface_labels(points+shift, mask)
+            self.assertEqual(count, 3)
+            self.assertNotEqual(labels[10, 14], labels[10, 15])
+            self.assertEqual(labels[0, 0], labels[19, 14])
+        # Continuous sloping surfaces stay connected independently of paint.
+        points[:, 15:, 2] -= .08
+        points[..., 2] = u*.001
+        self.assertEqual(surface_labels(points, mask)[0], 2)
+
+    def test_contact_section_and_occlusion_boundary(self):
+        rgb, depth, k, t = scene([(.1, 0, .03, .06)], .7)
+        body = rgb[..., 0] == 245
+        # A foreground neutral surface directly touches the silhouette in the
+        # image but is physically separated in depth, like a nearby arm.
+        rows, cols = np.nonzero(body)
+        occluder = np.indices(depth.shape)[1] > int(np.median(cols))
+        depth[occluder] *= .85
+        rgb[occluder] = [100, 100, 100]
+        result = measure(rgb, depth, k, t, 'surface', .7)
+        parts = [c for c in result['components'] if c['dominant_color'] == 'yellow']
+        self.assertEqual(len(parts), 1)
+        self.assertLess(parts[0]['top_z'], .83)
+        rgb, depth, k, t = scene([(.1, 0, .03, .06)], .7)
+        component = measure(rgb, depth, k, t, 'surface', .7)['components'][0]
+        contact = component['body_contact']
+        np.testing.assert_allclose(contact['center_xyz'][:2], [.1, 0], atol=.008)
+        self.assertGreater(contact['center_xyz'][2], .7)
+        self.assertLess(contact['center_xyz'][2], .7+.56*component['height_m'])
+        self.assertEqual(contact['kind'], 'surface_section_not_tcp_pose')
+
     def test_neutral_depth_components(self):
         centers = [(-.16, -.05, .035, .07), (.13, .10, .023, .045)]
         rgb, depth, k, t = scene(centers, .72)

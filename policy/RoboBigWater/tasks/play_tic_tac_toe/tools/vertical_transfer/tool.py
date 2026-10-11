@@ -158,8 +158,29 @@ def source_relief(api, source):
     cap = points[np.abs(points[:, 2]-top) < .003]
     if len(cap) < 20:
         return None
+    center = np.median(cap, axis=0)
+    low, high = np.quantile(cap[:, :2], [.02, .98], axis=0)
+    midpoint = (low + high) / 2
+    span = high - low
+    # Only infer a center for compact, approximately symmetric relief wholly
+    # inside the sampled disk. Cropped or asymmetric geometry is inconclusive.
+    centered = bool(np.all(span > .012) and np.all(span < .07)
+                    and max(span) / min(span) < 2
+                    and np.linalg.norm(center[:2] - midpoint) < .003
+                    and np.max(np.linalg.norm(cap[:, :2]-source[:2], axis=1)) < .042)
     return dict(top_z=float(top), visible_samples=len(cap),
-                visible_center=np.median(cap, axis=0).tolist())
+                visible_center=center.tolist(), center_checked=centered,
+                center_xy=midpoint.tolist() if centered else None)
+
+
+def source_alignment(source, view, approach):
+    # Tilted fingertips need orientation-specific contact geometry; do not
+    # mistake an intentional offset for a vertical centering error.
+    if approach != "down" or not view or not view.get("center_checked"):
+        return dict(checked=False, misaligned=False)
+    offset = float(np.linalg.norm(source[:2] - view['center_xy']))
+    return dict(checked=True, misaligned=offset > .006, offset_m=offset,
+                suggested_source=[*view['center_xy'], float(source[2])])
 
 
 def source_retained(api, source, baseline):
@@ -170,6 +191,40 @@ def source_retained(api, source, baseline):
     retained = len(cap) >= max(20, .6 * baseline['visible_samples'])
     return dict(checked=True, retained=bool(retained), visible_samples=len(cap),
                 visible_center=np.median(cap, axis=0).tolist() if len(cap) else None)
+
+
+def destination_change(api, reference, dest):
+    """Detect new relief at a requested endpoint against the first depth view.
+
+    Compare calibrated rays, not TCP height: a release TCP can be well above
+    both an empty surface and an obstruction. No scene coordinates are saved.
+    Unobserved initial regions are inconclusive, never certified clear.
+    """
+    baseline, k0, t0, _ = reference
+    depth, k, transform = depth_frame(api)
+    if (depth.shape != baseline.shape or not np.allclose(k, k0, atol=1e-8, rtol=0)
+            or not np.allclose(transform, t0, atol=1e-6, rtol=0)):
+        raise ValueError("destination camera changed")
+    v, u = np.indices(baseline.shape)
+    rays = np.stack(((u-k[0, 2])/k[0, 0], (v-k[1, 2])/k[1, 1], np.ones_like(u)), -1)
+    world = (rays * baseline[..., None]) @ transform[:3, :3].T + transform[:3, 3]
+    mask = (np.isfinite(baseline) & (baseline > 0)
+            & (np.linalg.norm(world[..., :2]-dest[:2], axis=-1) < .025)
+            & (world[..., 2] > dest[2]-.08) & (world[..., 2] < dest[2]+.02))
+    count = int(mask.sum())
+    if count < 20:
+        return dict(checked=False, blocked=False, reference_pixels=count,
+                    reason="insufficient_initial_depth")
+    valid = np.isfinite(depth[mask]) & (depth[mask] > 0)
+    # World-height rise along each original ray, including occluding geometry.
+    rise = (depth[mask]-baseline[mask]) * (rays[mask] @ transform[2, :3])
+    raised = valid & (rise > .005)
+    missing = int(np.count_nonzero(~valid))
+    blocked = missing > 0 or int(raised.sum()) >= max(5, int(np.ceil(.10*count)))
+    return dict(checked=True, blocked=bool(blocked), reference_pixels=count,
+                raised_pixels=int(raised.sum()), missing_pixels=missing,
+                reason="missing_depth" if missing else ("new_relief" if blocked else None),
+                destination_xy=dest[:2].tolist())
 
 
 def await_return(api, reference, maximum, require_change=True, accept_initial=False, initial_changed=False):
@@ -307,6 +362,8 @@ def run(api, command, args):
     visual_start = None
     source_view = None
     pickup_check = None
+    destination_check = None
+    alignment_check = None
     deposit_only = command == "deposit-transfer"
     try:
         if command not in ("vertical-transfer", "deposit-transfer"):
@@ -381,9 +438,17 @@ def run(api, command, args):
             if error > 0.008:
                 raise StopTransfer("tcp_position_error")
 
+        # Synchronization can change the destination after the caller chose it.
+        # Recheck while both arms are still home, before any pickup or rotation.
+        destination_check = destination_change(api, reference, dest)
+        if destination_check['blocked']:
+            raise StopTransfer("destination_changed")
         source_view = source_relief(api, source)
         if source_view is not None and source[2] < source_view['top_z'] - .003:
             raise StopTransfer("contact_below_visible_surface")
+        alignment_check = source_alignment(source, source_view, args.get("approach", "down"))
+        if alignment_check['misaligned']:
+            raise StopTransfer("source_center_misaligned")
 
         # Check after raised travel, when the source is no longer hidden by
         # our fingers. Retained relief is evidence against a successful pickup;
@@ -436,6 +501,8 @@ def run(api, command, args):
             "plan_detail": detail, "stages": stages, "released": released,
             "preflight": preflight, "visual_return": visual_return, "visual_start": visual_start,
             "source_view": source_view, "pickup_check": pickup_check,
+            "destination_check": destination_check,
+            "alignment_check": alignment_check,
             "holding_verified": False,
             "completion": "retracted" if deposit_only and reason is None else
                           ("synchronized" if reason is None else "incomplete"),

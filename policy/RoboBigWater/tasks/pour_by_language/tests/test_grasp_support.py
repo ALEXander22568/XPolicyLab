@@ -67,10 +67,80 @@ class SupportTests(unittest.TestCase):
         self.assertFalse(tool.support_profile(np.empty((0, 3)), [0, 0, .92], .06)['checked'])
         self.assertFalse(tool.grasp_support({}, [0, 0, .92], .06)['checked'])
 
+    def test_taper_rejected_and_lower_suggestion_preserves_endpoint(self):
+        for shift in (np.zeros(3), np.array([.23, -.14, .12])):
+            theta, z = np.meshgrid(np.linspace(-2.8, -.3, 50), np.linspace(.865, .915, 101))
+            radius = .04 - .7*(z-.865)
+            shoulder = np.column_stack((radius.ravel()*np.cos(theta.ravel()),
+                                        radius.ravel()*np.sin(theta.ravel()), z.ravel()))
+            points = np.concatenate((surface(.04, .78, .864, [0, 0]), shoulder)) + shift
+            source = np.array([0, 0, .89]) + shift
+            result = tool.support_profile(points, source, .09)
+            self.assertFalse(result['supported'], result)
+            self.assertEqual(result['reason'], 'observed_tapered_grasp')
+            suggestion = result['suggested_geometry']
+            self.assertAlmostEqual(suggestion['z'] + suggestion['tip'], source[2]+.09)
+            self.assertLess(suggestion['z'], source[2])
+            # A lower broad request remains eligible; sparse/off-axis data cannot
+            # manufacture evidence of taper.
+            self.assertTrue(tool.support_profile(points, np.array([0, 0, .83])+shift, .15)['supported'])
+            self.assertIsNone(tool.taper_evidence(shoulder[::100]+shift, source))
+            self.assertIsNone(tool.taper_evidence(shoulder+shift+[.02, 0, 0], source))
+
     def test_invalid_camera_data_is_unverified(self):
         observation = dict(depth={'cam_head': np.ones((20, 20))},
                            cameras={'cam_head': dict(intrinsics=np.eye(3), extrinsics_world=np.zeros((4, 4)))})
         self.assertFalse(tool.grasp_support(observation, [0, 0, .92], .06)['checked'])
+
+    def test_faceted_taper_with_unreliable_circle_centres(self):
+        theta, z = np.meshgrid(np.linspace(-2.8, -.3, 45), np.linspace(.865, .915, 61))
+        radius = .04 - .7*(z-.865) + .003*np.cos(5*theta)
+        shoulder = np.column_stack((radius.ravel()*np.cos(theta.ravel()),
+                                    radius.ravel()*np.sin(theta.ravel()), z.ravel()))
+        for shift in (np.zeros(3), np.array([-.19, .13, .17])):
+            source = np.array([0, 0, .89]) + shift
+            points = np.concatenate((surface(.04, .78, .864, [0, 0]), shoulder)) + shift
+            self.assertIsNone(tool.taper_evidence(shoulder+shift, source))
+            result = tool.support_profile(points, source, .09)
+            self.assertFalse(result['supported'], result)
+            self.assertEqual(result['method'], 'matched_angular_sectors')
+            self.assertGreaterEqual(result['lower_anchor_count'], 2)
+            suggestion = result['suggested_geometry']
+            self.assertAlmostEqual(suggestion['z']+suggestion['tip'], source[2]+.09)
+            self.assertTrue(tool.support_profile(points, np.array([0, 0, .83])+shift, .15)['supported'])
+            # Estimate and execution must reject the real geometric evidence,
+            # before either moves or requests an endpoint observation.
+            from test_transfer_cycle import tool as cycle, API
+            from unittest.mock import patch
+            for command in ('transfer-estimate', 'transfer-cycle'):
+                api = API()
+                args = dict(arm='left', x=source[0], y=source[1], z=source[2],
+                            tx=source[0], ty=source[1]-.15, tz=source[2]+.06, tip=.09)
+                with patch.object(cycle._axis, 'grasp_support', return_value=result):
+                    feedback, code = cycle.run(api, command, args)
+                self.assertEqual(code, 2, feedback)
+                self.assertEqual(feedback['plan_fail_reason'], 'observed_tapered_grasp')
+                self.assertEqual(api.events, [])
+
+    def test_sector_fallback_requires_matching_views_and_lower_axis_support(self):
+        source = np.array([0, 0, .89])
+        anchors = [dict(radius_m=.04, centre_xy=[0., 0.]) for _ in range(2)]
+        theta, z = np.meshgrid(np.linspace(-2.8, -.3, 45), np.linspace(.875, .905, 61))
+        def patch(radius):
+            radius = np.broadcast_to(radius, theta.shape)
+            return np.column_stack((radius.ravel()*np.cos(theta.ravel()),
+                                    radius.ravel()*np.sin(theta.ravel()), z.ravel()))
+        tapered = patch(.032-.7*(z-.875))
+        self.assertIsNotNone(tool.sector_taper_evidence(tapered, source, anchors))
+        for points, lower in ((tapered, anchors[:1]), (tapered[::70], anchors),
+                              (patch(.035+.003*np.cos(5*theta)), anchors),
+                              (patch(.025+.7*np.abs(z-.89)), anchors),
+                              (tapered, [anchors[0], dict(radius_m=.04, centre_xy=[.02, 0.])])):
+            self.assertIsNone(tool.sector_taper_evidence(points, source, lower))
+        # Different sectors at different heights cannot imply a taper.
+        unpaired = tapered[((z.ravel()<.889) & (theta.ravel()< -1.6)) |
+                           ((z.ravel()>=.889) & (theta.ravel()> -1.4))]
+        self.assertIsNone(tool.sector_taper_evidence(unpaired, source, anchors))
 
 
 if __name__ == '__main__':

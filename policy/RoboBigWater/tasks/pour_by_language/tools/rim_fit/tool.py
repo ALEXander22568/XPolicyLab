@@ -15,7 +15,7 @@ TOOL = {'name': 'rim_fit', 'commands': [{
              {'name': 'v', 'type': 'int', 'required': True},
              {'name': 'camera', 'default': 'head'},
              {'name': 'window', 'type': 'int', 'default': 60},
-             {'name': 'band', 'type': 'float', 'default': .015},
+             {'name': 'band', 'type': 'float', 'default': .04},
              {'name': 'reach', 'type': 'float', 'default': .12}]}]}
 
 
@@ -65,9 +65,30 @@ def run(api, command, args):
     try:
         if command != 'rim-fit':
             raise ValueError('invalid command')
-        a = dict(camera='head', window=60, band=.015, reach=.12)
+        # Interior seeds can sit well below the upper lip. A narrow crop can
+        # turn a tapered wall's highest retained slice into a false rim.
+        a = dict(camera='head', window=60, band=.04, reach=.12)
         a.update(args)
-        result = axis.locate(api.observe(), a, fitter=fit_rim, model_name='horizontal_circular_rim')
+        def fit_unclipped(points):
+            result = fit_rim(points)
+            radial = np.linalg.norm(points[:, :2]-result['centre_xy'], axis=1)
+            higher = ((points[:, 2] > result['rim_z']+.003)
+                      & (radial >= .75*result['radius_m'])
+                      & (radial <= 1.5*result['radius_m']))
+            # A cropped upper arc may fail the 220-degree fit while a lower
+            # wall fits fully. Do not silently step down past that evidence.
+            if np.count_nonzero(higher) >= 40:
+                raise ValueError('supported annular surface above candidate; '
+                                 'upper rim is incomplete, widen the patch/band or change seed')
+            return result
+        result = axis.locate(api.observe(), a, fitter=fit_unclipped, model_name='horizontal_circular_rim')
+        upper = result['surface_world'][2] + float(a['band'])
+        if upper - result['rim_z'] <= .003:
+            return dict(plan_ok=False, plan_fail_reason='rim_search_clipped',
+                        plan_detail='Circular section reaches the upper height boundary; '
+                                    'use a higher seed or a wider band within 0.01..0.04 m.',
+                        search_upper_z=upper, candidate_rim_z=result['rim_z']), 2
+        result['search_upper_z'] = upper
         return dict(result, plan_ok=True, plan_fail_reason=None), 0
     except Exception as exc:
         return dict(plan_ok=False, plan_fail_reason='perception_failed', plan_detail=str(exc)), 2

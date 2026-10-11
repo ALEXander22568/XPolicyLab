@@ -1,61 +1,45 @@
 # Tool development findings
 
-Final records: 3/10 layouts passed across evolving revisions; no final-version sweep establishes general reliability.
-Kept two enabled modules: color_geometry (read-only RGB-D geometry) and guarded_transfer (clearance, preflight, staged execution and lift verification).
-Useful designs: nullable perception estimates, actual CLI/schema tests, pre-motion baselines, complete-path preflight, vertical release withdrawal and explicit partial-execution status.
-Costs matter: local height profiles improved reach but added stops; upward compaction and time-ranked profiles reduced that overhead. Bounded read-only alternatives avoid blind physical retries.
-Unresolved: cross-arm reach, robot-depth false positives, occlusion, grasp/placement drift and manual recovery collisions. R47 succeeded despite two false lift stops with payloads held.
-Hue-only clearance missed obstacles; broad capsules and sparse self-depth spheres overblocked. Detailed hardware hulls help coverage but may hide contacting geometry; preserve endpoint evidence and conservative fallbacks.
-Use only measured observations, TCP/joints and public static hardware models at runtime. Test translated/rotated scenes, empty lifts, every failed stage, missing calibration and CLI parsing; never encode layout coordinates.
-Last recorded local validation: 101 transfer-module + 6 geometry tests passed. Synthetic/public-API doubles establish contracts, not physical reliability; saved episodes lack raw depth for pixel-level replay. No evaluations run in finalization.
+v0.2r2: all ten development layouts eventually passed (standard 5/5, random 5/5); three failure-driven edits, not a final-version sweep.
+Enabled modules: `color_geometry` measures RGB-D; `guarded_transfer` provides contact conversion, free planning and checked transfer execution.
+Successful episodes used 15–53 commands and 482–1,028 action steps; uprightness came from the final checker, not transfer completion.
 
-## Development log (condensed; original dates retained)
+Designs that worked:
+- Metric depth connectivity, circular sections and nullable contact estimates expose geometric ambiguity; RGB still distinguishes clutter. Calibrated opposed-pad conversion separates measured contact from TCP pose.
+- Full-path reach, observed hand sweeps and payload corridors reject hazards before closure; bounded orientation/axis/route alternatives improve feasibility without physical retries.
+- Full-opening finger bounds at BOTH endpoints close a support-plane blind spot; low tilted poses can intersect support even when observed obstacle checks pass.
+- Immutable calibrated per-view baselines, surface translation matching and alternate views handle occlusion. Filter modeled elevated robot depth consistently before and after lift; retain endpoint evidence and missing-model fallbacks.
+- Time-ranked carry profiles, per-call caches and compact diagnostics reduce planning work. Independent IK evidence explains collision rejection without overriding it.
+- Vertical withdrawal clears the translated top before lateral departure; table handoffs and refreshed geometry extend reach. Return stage/closure/release evidence because failure can leave a payload held.
 
-- 2026-10-02 — Round 5: Approach occluded lift baseline; moved measurement before all motion and exposed expected/observed rise; 18 local tests.
-- 2026-10-02 — Camera alias: Camera alias head failed against cam_head; resolved available cam_* aliases; 3 geometry tests.
-- 2026-10-01 — Initial geometry: Guessed axes caused pushing/off-center grasps; added calibrated component geometry, support and agreeing circular fits; unresolved centers return null; 2 tests.
-- 2026-10-01 — Round 3: Zero-command agent_exit had no diagnostic trace; left tools unchanged.
-- 2026-10-02 — Round 2: Diagonal withdrawal tipped a release and failed moves preceded empty carries; added guarded vertical stages, lift verification and stop-on-failure; 8 tests.
-- 2026-10-02 — Round 3: Low carried bottoms struck neighbors; added transfer_clearance with footprint/support-offset corridor heights; robot depth could inflate estimates; 13 tests.
-- 2026-10-02 — Round 4: Hyphenated schema names disagreed with argparse keys; standardized underscore flags and tested actual CLI/server validation; 17 tests.
-- 2026-10-02 — Round 7: Omitted support disabled collision checks; made clearance mandatory with observed support estimation.
-- 2026-10-02 — Round 8: Robot depth blocked clear endpoints; hue-scoped obstacles reduced contamination but missed other surfaces (revised R18/23).
-- 2026-10-02 — Round 9: High direct carries failed IK; added bounded observed lateral detours and direct override.
-- 2026-10-02 — Round 10: Valid lifts showed excessive top rise; added coherent translated-surface overlap against stationary evidence.
-- 2026-10-02 — Round 11: Uniform high routes exceeded reach; introduced per-segment carry elevations and vertical transitions.
-- 2026-10-02 — Round 12: Carry IK failed after grasp; preflighted the complete path using public calibrated kinematics before motion.
-- 2026-10-02 — Round 13: Micrometre height changes wasted settling time; merged collinear intervals within 1 mm at their maximum.
-- 2026-10-02 — Round 14: One preferred detour could fail reach; preflighted up to seven routes before rejecting.
-- 2026-10-02 — Round 15: Many local-height stops exhausted time; ranked constant/local profiles by motion plus settling cost.
-- 2026-10-02 — Round 16: Constant heights failed near reach limits; added two intermediate upward-merged profiles per route.
-- 2026-10-02 — Round 17: Head occlusion rejected actual lifts; added calibrated alternate-view surface correspondence.
-- 2026-10-02 — Round 18: Requested-hue obstacles missed differently painted neighbors; separated verification hue from all bright chromatic obstacles.
-- 2026-10-02 — Round 19: Approach passed below source top and tipped it; separated empty-hand approach elevation from carry elevation.
-- 2026-10-02 — Round 20: Final withdrawal timed out; preflighted combined high rotation/translation and lowered default minimum clearance to .04 m.
-- 2026-10-02 — Round 21: Opposite-hand interference accompanied tracking error; added measured swept-hand capsule preflight, not full-arm collision checks.
-- 2026-10-02 — Round 22: Random paint defeated hue-only perception; added depth surface/combined-hue geometry and observed hue counts; 6 geometry tests.
-- 2026-10-02 — Round 23: Transfer still required bright paint; added surface verification with distributed translated overlap and all-depth obstacles.
-- 2026-10-02 — Round 24: Pose-dependent false occupancy inflated routes; subtracted elevated active-arm depth using calibrated public FK spheres.
-- 2026-10-02 — Round 25: Combined approach displaced source; bounded rotating hand by TCP/end-link extent plus .075 m and margin.
-- 2026-10-02 — Round 26: Descent displaced neighbors; preflighted observed depth against descending hand, protecting source footprint.
-- 2026-10-02 — Round 27: Initial hand depth blocked future descent; removed modeled depth above both endpoint bands independently of initial TCP.
-- 2026-10-02 — Round 28: Self-depth inflated corridor/source top; revised elevated robot filtering while protecting low source evidence.
-- 2026-10-02 — Round 29: Sparse spheres missed open-hand surfaces; added calibrated collision hulls with hardware/open-command gating.
-- 2026-10-02 — Round 30: Wrist surfaces remained outside sparse spheres; added measured wrist hull supplement; unavailable data keeps depth.
-- 2026-10-02 — Round 31: Approach IK/wrist branch jumps blocked motion; added checked orientation stations at 50%/75% of horizontal approach; 78 transfer tests.
-- 2026-10-02 — Round 32: Broad descent capsule rejected thin-side free space; refined matching open-hand sweeps with padded hulls and proximal wrist cap; 79 tests.
-- 2026-10-02 — Round 33: Default departure skipped scene checks; checked raise/rotation/combined approach before execution; 81 tests.
-- 2026-10-02 — Round 34: Broad departure capsule overblocked; refined fixed-orientation sweeps and added intersecting world bounds; 82 tests.
-- 2026-10-02 — Round 36: Wrist camera/mount absent from robot model; added public-mesh hulls transformed by measured end-link pose and offline builder; 84 tests.
-- 2026-10-02 — Round 38: Global low-depth protection retained distant hand surfaces; removed detailed hull members only outside padded endpoint footprints; 85 tests.
-- 2026-10-02 — Round 39: Link4 sphere missed 1,331/1,403 mesh vertices; added full bracket hull via measured joints/end-link transforms; 87 tests.
-- 2026-10-02 — Round 40: Forearm spheres missed 8,624/10,476 vertices; added link3 hull and offline builder; 89 tests; episode pixel attribution unproven.
-- 2026-10-02 — Round 41: Initial TCP protection retained raised-hand hull depth over source; detailed members now use both endpoint bands +.02 m; 91 tests.
-- 2026-10-02 — Round 42: Fixed .5 mm matching ignored pixel footprint; added calibrated half-pixel plane support capped at 2 mm extra, no optical-axis expansion; 94 tests.
-- 2026-10-02 — Round 43: Checker treated unchanged poses as motion due to rotation roundoff; shared execution no-op tolerances (1 mm/.001 matrix entry); 96 tests.
-- 2026-10-02 — Round 44: Rotation retained overbroad capsule; refined each open-hand rotation frame, sampling outer-hand travel at ≤5 mm; 97 tests.
-- 2026-10-02 — Round 45: All obstructed approaches shared one height; preflighted +.04/.08 m candidates, capped .25 m above endpoints; 100 tests; extra motion may cost time.
-- 2026-10-02 — Round 46: Withdrawal ended below released top before 130 mm displacement during home; raised/preflighted withdrawal above translated source top + margin; 101 tests.
-- 2026-10-02 — Round 48: distilled three successful procedures, retained failure limits and dated history, shortened interfaces; runtime tools unchanged.
+Failures and limits:
+- Hue-only geometry missed random paint/clutter; image connectivity merged surfaces. Metric adjacency helps but cannot split actual contact or establish semantic identity.
+- Broad collision capsules overblocked; sparse spheres missed camera/arm geometry. Public calibrated hulls help, but overlap may hide contacts and full-arm collision freedom remains unverified.
+- Uniform high routes failed reach; many short height stops wasted steps. Above-body height checks prevent some empty grasps but cannot certify stable contact.
+- Auto search cannot fix support-incompatible endpoints; contact_pose defaults remain explicit down/x. Standard 3's success used explicit axes and did not validate a successful automatic axis fallback.
+- Descent stops persisted in four v0.2r2 successes; random 3 stopped a true ≈.04 m lift. Keep conservative stops: saved frames lack raw depth for exact pixel attribution.
+- Manual diagonal motion, stale coordinates, early homing and releases after failed lowering caused tipping/displacement. Random 1 left 22 steps; random 4 required slip recovery and left 70.
+- No general upright recovery or final placement certification exists; `placement_verified=false` remains explicit. Successful manual rescues do not validate bypassing motion guards.
 
-- Final retest 2026-10-02 (official motion timing only; final tools, one run per layout, no optimizer): retest passed: 2 / 10
+Tool-writing advice: use only public observation/calibration/TCP/joints, keep perception and preflight free, bound search, refresh caches after motion, and never encode layout coordinates.
+Test translated/rotated geometry, both endpoint supports, unavailable calibration, stationary empty grasps, all execution-stop stages, no-actuation contracts and post-motion no-retry behavior.
+Last implementation validation recorded 168 transfer + 8 geometry tests passing; synthetic contracts do not establish physical reliability. This finalization checks documentation only; no evaluation/server run.
+
+## Development log (condensed; dates retained)
+
+- 2026-10-01 — Initial measured components, support/circular fits and nullable centers replaced guessed axes that pushed bodies; a zero-command exit supplied no actionable evidence.
+- 2026-10-02 — Added camera aliases, guarded vertical stages, pre-motion lift baselines, measured clearance, CLI flags and stop-on-failure behavior.
+- 2026-10-02 — Added bounded detours, complete IK preflight, local/merged time-ranked heights, surface/all-depth obstacles, translated-surface matching and alternate views.
+- 2026-10-02 — Added hand/descent/departure sweeps and public wrist/camera/link hulls, endpoint protections, rotation stations and top-clearing retreat; 101 transfer + 6 geometry tests. Historical v0.1 development 3/10; final retest 2/10.
+- 2026-10-09 — v0.2 R3/R4: opaque rejection/manual collisions prompted free transfer_plan, compact diagnostics, independent reach evidence, caching and bounded down/down45 preflight; no post-motion retry; 109+6 tests.
+- 2026-10-09 — R5/R6: departure overblocking prompted calibrated link2 hulls and strictly separating vertical escape from margin-only occupancy, retaining inner-envelope/endpoints and final clearance; 114 transfer tests.
+- 2026-10-09 — R7/R10: empty high grasps prompted metric connectivity, body_contact and visible-height bounds; slow rejection prompted immutable descent/prefix caches; 119 transfer + 8 geometry tests by R10.
+- 2026-10-09 — R11/R12: true lifts rejected by mismatched views prompted separate same-view baselines; missed angled contact prompted calibrated contact_pose and support clearance; 125+8 tests.
+- 2026-10-09 — R14: reported success displaced a neighbor ≈.193 m; added all-aperture hand sweeps through lift/carry/lower/withdraw, preserving destination obstacles; 129+8 tests.
+- 2026-10-10 — v0.2 R18/R20: excessive apparent rise on a true lift prompted alternate-view checks without weakened thresholds; 131+8 tests. Finalized 9/10 development outcomes with unresolved stability/verification limits.
+- 2026-10-10 — v0.2r2 R4: standard 3 exhausted 60 commands/688 steps after 13 rejections and manual collisions. Added open=auto: down/x, down/y, down45/x, down45/y, constrained by explicit options; unchanged guards/endpoints and no retry after motion; 135 transfer tests. Retried layout passed at 18 commands/845 steps using explicit axes.
+- 2026-10-10 — R6: standard 4 failed at 56/871; a completed down45/y transfer displaced rank 3 by 69 mm and left it down. Its full-opening finger bound was 26 mm below measured support; exact tipping stage unknown. Added 2 mm support clearance at grasp AND release with minimum_tcp_z/support_compatible evidence; 165 transfer tests. Retry passed at 21/720.
+- 2026-10-10 — R10: random 2 failed at 60/834 after manual collisions. Filtered corridor top .85661 m versus raw baseline 1.09408 m forced false excessive withdrawal clearance; exact offending pixels unavailable. Added immutable per-view robot-depth filtering before/after lift with protected endpoint bands, model fallbacks and verification_filter diagnostics; no relaxed thresholds or physical retry; 168+8 tests. Retry passed at 40/796; later random 3 still had a lift stop.
+- 2026-10-10 — R14 finalization: distilled all ten successful v0.2r2 procedures and retained dated development history, failed approaches and unresolved uprightness/recovery limits. Runtime code and enabled modules unchanged; interface/document length and vocabulary checked.
+
+- Final retest 2026-10-10 (final tools, one run per layout, no optimizer): retest passed: 7 / 10

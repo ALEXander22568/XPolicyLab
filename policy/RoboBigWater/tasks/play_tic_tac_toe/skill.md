@@ -1,27 +1,24 @@
-# play_tic_tac_toe tool development
+# Tool development: play_tic_tac_toe
 
-## Outcome and final design
-- Recorded final attempts: 9/10 successes, mean score 93; layout 0 remained at 30%. Layouts 4–9 used the final tools and succeeded in 7–8 commands / 1024–1084 steps; earlier successes used older versions.
-- Enabled modules: vertical_transfer, wait_clear, wait_view. All geometry comes from caller coordinates or calibrated observations; no simulator poses or stored layout coordinates.
-- vertical-transfer preflights the complete TCP chain and home cost, checks tracking within 8 mm, keeps a fixed caller-selected contact orientation, and enforces >=30 mm raised travel.
-- It retains an episode-local elevated depth reference, requires both arms home, and enforces observed departure then return within 8 mm for 0.6 s; pending departure/return survives timeout.
-- Default wait is 6 s; legacy wait_sec=0 also selects 6 s. Interior reference rays exclude silhouette discontinuities; changed cameras or invalid depth fail closed.
-- finish-transfer retracts and homes an open gripper, then resumes synchronization; already-home recovery only holds. It requires a prior transfer reference and the other arm home.
-- deposit-transfer budgets only through release/retraction, leaving home and synchronization pending. It enables the final placement within the remaining budget without changing contact geometry.
-- Source-depth checks reject clearly below-surface contact and retained material after >9 cm transit; failure stops before release. Missing evidence is inconclusive and holding_verified stays false.
-- wait-clear measures a caller-selected world box; foreground occlusion and missing depth count as blocked. An empty box cannot establish completion of delayed activity.
-- remember-view/wait-view compare a caller-selected depth crop. Standalone change detection is per call; it does not inherit the transfer module's persistent pending handshake.
+## Results and evidence
+- v0.2r2 supplied final attempts: 10/10 auto_success, score 100; 6–8 charged commands, 1007–1059 steps (mean 1033.6) of 1100. Versions evolved during development; this is not a fresh final-version evaluation.
+- Earlier v0.1 official three-seed success was 36% / 44% / 34%, despite a 9/10 development retest. Development success does not establish unseen-seed reliability.
+- Current run added two guards after layout 6 scored 30% and layout 7 scored 50%; subsequent supplied attempts passed. Passing attempts did not exercise either new rejection, so prevention is supported by synthetic tests, not a physical counterfactual.
+- All final attempts stopped during deposit-transfer; final homing/settling remains unverified. Layouts 0, 1, 3, 4 left fewer than the required 60 home steps. Do not equate auto_success with full procedural completion.
 
-## Lessons and limits
-- Preflight the entire route before grasping and repeat the time estimate after holds. IK feasibility does not certify collision clearance, grasp, or release accuracy.
-- Keep contact orientation explicit and fixed while carrying: automatic tilt produced 19–33 mm placement errors despite accurate TCP tracking; constant tilt alone did not solve contact geometry.
-- Integrate synchronization into the execution command agents already use. Separate optional gates were ignored or bypassed; fixed waits and preparing another grasp during response motion caused overlap.
-- Preserve both pending completion and observed departure across timeout recovery. A matching initial frame or zero different pixels is insufficient until the stable-return duration completes.
-- Returning home starts the response; waiting away from home wastes budget. Do not weaken synchronization to recover that lost time.
-- Use actual server observation keys (cam_head/cam_left_wrist/cam_right_wrist), not only exported client aliases. Synthetic fixtures initially hid a schema defect.
-- Commanded gripper opening is not grasp evidence. Visible retained source material can disprove pickup, but its absence cannot prove holding; nearby relief can cause conservative rejection.
-- Motion estimates exclude response waits. Later four-turn cycles consumed 37.72–40.16 of 44 s; final success usually interrupted lowering before release, so full final settling/home remains unverified.
-- Historical local regression count reached 68 mocked/public-API tests. These establish software contracts, not physical reliability or generalization to unseen layouts.
+## Designs and lessons
+- Enabled modules: vertical_transfer, wait_clear, wait_view. Geometry uses caller coordinates or calibrated observations; no simulator poses or remembered layout constants.
+- vertical-transfer preflights the complete TCP chain and home cost, checks tracking within 8 mm, holds a fixed explicit contact orientation, and enforces >=30 mm raised travel. IK does not certify collision clearance or accurate release.
+- Persistent elevated depth reference requires both arms home, observed departure, then return within 8 mm for 0.6 s; pending departure/completion survives timeout. Default wait is 6 s; wait_sec=0 also selects default.
+- finish-transfer retracts/homes an open gripper and resumes synchronization; already-home recovery only holds. deposit-transfer ends after release/retraction, leaving home/synchronization pending.
+- Destination guard runs after pending synchronization and before pickup: initial calibrated rays within 25 mm XY, >5 mm new height on >=10% (minimum five) rays, or missing current depth reject. Insufficient initial coverage is inconclusive; pre-existing occupancy is not detected.
+- Source guard rejects >6 mm vertical contact offset from compact symmetric depth relief and suggests XY while preserving requested Z. Cropped/asymmetric relief and down45 remain inconclusive; no automatic substitution.
+- Source depth also rejects clearly low contact and retained material after >9 cm transit. Missing evidence cannot prove holding; holding_verified stays false.
+- Separate optional clearance gates were bypassed; integrate checks into the execution path. Empty transit space can precede delayed motion; wait-clear alone cannot establish completion.
+- Standalone wait-view departure detection is per call, unlike persistent transfer synchronization. A matching frame or zero changed pixels is insufficient until the stable duration completes.
+- Recheck destination after waiting: occupancy can change during synchronization. Reject uncertain contact before grasping; a source offset propagates into release error despite accurate TCP tracking.
+- Automatic tilt and post-grasp rotation produced 19–33 mm errors historically; explicit fixed down45 helps reach but requires orientation-specific contact geometry. Low transit displaced existing contents.
+- Use native observation keys and translated/cropped camera fixtures. Historical regression total: 76 synthetic/public-API tests; software checks cannot certify physical robustness.
 
 ## Development log
 - 2026-10-03, r1: Diagonal pickup shoved the final ring ~3 cm; added vertical entry/exit, raised travel, measured TCP checks, and homing.
@@ -43,5 +40,12 @@
 - 2026-10-03, r17: Too-low contact and an empty angled transfer wasted 10.8 s; added source-depth contact and retained-material checks. Local regression total: 68 passing.
 - 2026-10-03, r18–23: Layouts 4–9 passed without further tool edits. finish-transfer recovered timeouts; explicit angled retries preserved clearance; final deposit completed the terminal placement.
 - 2026-10-03, r24: Distilled final playbook, tool-development notes, and interfaces from the recorded run; retained limits on release confirmation, visual inference, and historical-version evidence.
+- 2026-10-03, final retest: final v0.1 tools passed 9/10 development layouts; later official three-seed results were substantially lower.
+- 2026-10-10, v0.2r2 r1–6: layouts 0–5 passed without edits; four synchronized transfers, explicit angled retry, final deposit; 1032–1059 steps. Short wait caps caused recoverable timeouts.
+- 2026-10-10, v0.2r2 r7: layout 6 used a cell occupied during pending synchronization; overlap stalled alternation (30%, 1053 steps). Added destination_change after waiting/before pickup; 73 local tests passed.
+- 2026-10-10, v0.2r2 r8: layout 6 passed in 8 commands / 1029 steps; corrected contact height and explicit down45, with destination checks before all pickups.
+- 2026-10-10, v0.2r2 r9: layout 7 grasped 10–12 mm off-center and released 10–17 mm behind targets (50%, 1046 steps). Added source_center_misaligned for vertical grasps; translated/cropped/angled/zero-motion tests brought total to 76.
+- 2026-10-10, v0.2r2 r10–12: layouts 7–9 passed in 6–8 commands / 1007–1036 steps; guards passed, explicit angled retries and finish-transfer recovered reach/timeouts.
+- 2026-10-10, v0.2r2 r13: distilled final documentation from ten supplied successes and development logs; retained terminal-homing and generalization limits; no executable tool changes or evaluations.
 
-- Final retest 2026-10-03 (final tools, one run per layout, no optimizer): retest passed: 9 / 10
+- Final retest 2026-10-10 (final tools, one run per layout, no optimizer): retest passed: 10 / 10

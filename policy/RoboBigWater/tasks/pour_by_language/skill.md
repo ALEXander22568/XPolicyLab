@@ -1,45 +1,46 @@
 # pour_by_language tool development
 
 ## Results and design lessons
-- Final archive: 0/10 successes, progress 0; 7 done failures, 3 timeouts. Fifty-four edits produced eight enabled tools; no complete solution was demonstrated.
-- Useful partial results: measured interior axes/rims/endpoints, bounded compensated paths, checked release poses and verified home. Latest layout completed 785 motion steps, then one redundant home step; done failed at 31.44/32 s.
-- Keep motion success, visual evidence and scene completion separate. Accurate TCP does not verify attachment, source attitude, capture, residue or assignment; archived truth positions cannot identify every failed predicate.
-- Runtime geometry must come from caller arguments and calibrated observations; only public EpisodeAPI robot state and primitives are permitted. True poses are diagnosis evidence, never runtime constants.
-- Test real server camera aliases and units; synthetic client-format observations hid an integration defect. Reject unsupported fits and return support/residuals instead of manufacturing centres.
-- Sample interpolated paths, both tilt signs, translated scenes and varied lengths. Endpoint alignment alone hid 17–61 mm excursions; current nominal XY chord bound is 2.5 mm, conditional on supplied rigid geometry.
-- Use integer action steps for admission; keep timing estimates explicitly heuristic and terminal joint timing separate. Historical fixed settling assumptions became stale as the shared server changed.
-- Bound holds and retries, verify measured release/home state, and report held/closed failure state. More dwell, deeper inversion and accurate endpoints never established full scene success.
-- Existing tests cover geometry, calibrated depth, API-only mocks, budgets and failures; historical round 54 reports 132 passing tests. They do not replay physics or prove task success.
+- Current development run: all 10 layouts passed after six failure-mode edits (1+3+1+1 on layouts 0/4/6/9); successful episodes took 695–735/800 ticks. Tools evolved between layouts; no all-layout final-version retest is included.
+- Earlier v0.1 development/retest failed 10/10; v0.2's five-layout archive and later ten-layout retest also had no success. Those historical results do not describe this run.
+- Every current success terminated during final upright recovery. Evaluator success is established; final replacement/home completion is not. Human guidance identifies a broken zero-progress trigger, separate from the functioning success check.
+- Runtime geometry comes only from caller inputs and calibrated EpisodeAPI RGB/depth/camera matrices. True poses diagnose failures offline; never encode archived coordinates or hidden state into tools.
+- Fit interior axes, visible endpoints and highest supported rims separately. Require coverage and reject clipped/lower rim candidates; failed fits and unavailable evidence remain explicit unknowns.
+- Decouple geometric envelope acquisition from grasp classification: missing cylindrical grasp radii previously raised a caught KeyError and silently disabled all arc lowering/terminal analysis.
+- Acquisition checks need repeated lift observations and support geometry. Thin-ring fits can miss faceted taper; matched depth sectors anchored by repeated lower-axis fits provide a complementary rejection test.
+- Keep the measured destination fixed when optimizing time. Higher-grasp suggestions preserve endpoint height and need positive support; unavailable support is ineligible for a timing suggestion.
+- Compensate tip XY throughout outward/reverse arcs; bound interpolation error and test continuous envelope minima. Removing acceleration stops saved path complexity without shortening the 45-tick hold; the 8.5 mm chord allowance remains a capture tradeoff.
+- Partial visible envelopes are not whole-arm collision checks. Lowering uses a 20 mm early cap and 50 mm hand allowance; an extra post-horizontal extension is withheld across a segment crossing 90°.
+- Use measured convergence and bounded settling. A small improving release residual warranted four extra ticks, not a weaker release tolerance or unlimited retry.
+- Expose held state, failed stage and explicit suggestions. Manual recovery after unstable acquisition displaced receivers and consumed the remaining budget.
+- IK and Cartesian timing estimates omit execution costs; retain live integer-step admission/reserves. Diagnostics for axis/surface changes never establish attachment, transferred mass or completion.
+- Final runtime contract: signed 140° inversion, ≥1.80 s stationary exposure, upright transport, depth-based lift correction, clearance gates and optional concurrent home. Other enabled tools support perception or separate operations; success traces primarily used transfer-cycle.
+- Latest development log reports 192 passing local tests covering calibrated geometry, signed/translated arc sweeps, envelopes, taper, budgets and bounded failures. Synthetic tests are not physics evaluations.
 
 ## Development log
-- 2026-10-02, rounds 1–3: low travel displaced neighbours; added raised transfer-cycle, tip-aware empty clearance and compensated partial tilt. Shorter paths still timed out; attachment stayed unverified.
-- 2026-10-02, round 4: added opt-in front corridor and free estimates to reduce travel. Later evidence invalidated the estimate's original lower-bound claim.
-- 2026-10-02, round 5: 3.03 rad IK configuration jump prompted one time-checked split aim, only after an unmoved failure; other errors stop without retry.
-- 2026-10-02, rounds 6–7: rejected shallow/no-dwell shortcuts and overlapped opening with retreat, saving 8 stationary ticks per default cycle; transfer remained unverified.
-- 2026-10-02, rounds 8–9: added concurrent measured joint-return; fixed 1.56+0.08>1.64 floating-point rejection with integer-step admission.
-- 2026-10-02, rounds 10–11: 13.2 mm/2.65° tilt error motivated measured continuous exposure; suspected opposite-hand contact motivated bounded inactive-hand retraction, not full collision checking.
-- 2026-10-02, rounds 12–13: added deadline acceleration and measured early settling while retaining 2 rad/s speed and live-step margin; synthetic timing was not a physical replay.
-- 2026-10-02, rounds 14–15: roughly 20 mm surface-to-axis grasp error motivated axis-fit; repaired head versus cam_head calibration lookup and tested all aliases.
-- 2026-10-02, rounds 16–17: repeated home after verified return exhausted deadlines; added free status, shared-target evidence and best-effort 13-tick headroom. Actor still repeated motion.
-- 2026-10-02, rounds 18–20: longer dwell and combined recovery failed; diagnosed up to 61.2 mm departure drift at horizontal and restored recovery over target. Fluid loss remained a hypothesis.
-- 2026-10-02, rounds 21–22: shallow inversions and steep travel overrides accompanied spills; minimum endpoint became 120° and travel was restricted. Neither proved complete capture.
-- 2026-10-02, rounds 23–24: exposed redundant-home deadline costs and integrated finish_home; estimates explicitly excluded future joint return time.
-- 2026-10-02, round 25: corrected 17.4 mm nominal horizontal-crossing error despite accurate endpoints; later full-arc subdivision superseded this chord approximation.
-- 2026-10-02, rounds 26–27: direct post-release home accompanied 59 mm source displacement; restored withdrawal and surfaced home verification before stage traces. Subsequent sources stood near initial positions.
-- 2026-10-02, rounds 28–30: geometry-aware recovery tolerance reduced unnecessary interruption; added 2 mm/0.5° release gate and up to 12 converging closed-hand ticks. Persistent contact/slip remained unresolved.
-- 2026-10-02, rounds 31–32: neighbour displacement motivated upright front routing; added measured staging 10 mm above placement before final descent. Stalled replacements persisted.
-- 2026-10-02, rounds 33–34: narrow upper grasps motivated depth section comparisons; manual diagonal entry caused a 96 mm knockdown, motivating standalone side-pick with visual lift evidence.
-- 2026-10-02, rounds 35–36: permitted at most 3 completion ticks for already continuous accurate dwell; separated front lowering, insertion and withdrawal. Leaning sources still lacked a conclusive cause.
-- 2026-10-02, rounds 37–38: manual target misalignment motivated standalone tip-tilt; raised cycle default dwell to 0.60 s after accurate short holds still failed. Neither established completion.
-- 2026-10-02, rounds 39–40: removed obsolete per-move settling surcharge and lower-bound labels; bounded withdrawal by TCP-to-wrist displacement. Tool estimates had been discouraging full-cycle use.
-- 2026-10-02, rounds 41–42: front-entry contact made overhead entry default; roughly 20 mm target-Y error motivated rim-fit. Accurate rim targeting still did not yield success.
-- 2026-10-02, rounds 43–45: made upright loaded transport default, then mandatory after overrides bypassed it; added horizontal-crossing compensation. Scene checks continued failing.
-- 2026-10-02, rounds 46–47: expanded compensation to the whole arc and bounded nominal XY drift to 2.5 mm; required 0.60 s dwell. Visible deposits and stationary receivers were insufficient evidence.
-- 2026-10-02, rounds 48–49: tip-fit addressed guessed endpoint height; 85–123 mm receiver shifts motivated preserving raised clearance through horizontal rotation. Swept-shape clearance remains unverified.
-- 2026-10-02, round 50: changed convergence metric to excess above tolerance; 2.335→2.105 mm had narrowly failed the old 10% total-error test. Strict release tolerances stayed unchanged.
-- 2026-10-02, round 51: final home needed 31 ticks with 27 left; curvature-adaptive whole-tick arc spacing reduced stops while retaining the 2.5 mm nominal bound.
-- 2026-10-02, rounds 52–53: raised default then minimum dwell to 0.80 s because explicit 0.60 s overrides bypassed the experiment; all three longer dwells ran in the last archive, still unsuccessfully.
-- 2026-10-02, round 54: added axis-pose from two visible sections to expose inclination; does not verify association, axial rotation or attachment. Only local synthetic validation is recorded.
-- 2026-10-02, round 55: finalized documentation and condensed this dated log; preserved failed-outcome evidence and current contracts. No motion code, tool enablement, evaluation or server changes.
+- 2026-10-02, v0.1 r1–13: added transfer-cycle, front routing, split-aim fallback, concurrent joint-return, settling/retraction and integer-step admission; transfer remained unverified.
+- 2026-10-02, v0.1 r14–27: added axis-fit/camera aliases, free home status, compensated recovery, integrated home and release withdrawal to address bias, drift and deadlines.
+- 2026-10-02, v0.1 r28–42: added strict placement settling, side-pick/tip-tilt, overhead entry and rim-fit; no complete success.
+- 2026-10-02, v0.1 r43–55: added upright transport, whole-arc compensation, tip-fit, adaptive spacing, 0.80 s dwell and axis-pose; development and retest both failed all ten layouts.
+- 2026-10-09, v0.2 r1–4: added required annulus lift checks, ≤3 reads requiring two agreeing fits, four staging-settle ticks and advisory axis-track after acquisition interruptions.
+- 2026-10-09, v0.2 r5–7: envelope-supported lowering stalled; disabled it and added advisory destination-surface evidence. Neither surface rise nor successful motion proved capture.
+- 2026-10-09, v0.2 r8–13: tested/enforced 125° and 0.96 s dwell; added IK cost evidence and depth-based entry rejection after underestimated cost and neighbour displacement.
+- 2026-10-09, v0.2 r14–15: restored lowering with 20 mm cap/50 mm hand allowance; raised minimum inversion to 130° without proven capture.
+- 2026-10-10, v0.2 r16–20: tried 30 mm lowering, 1.10 s dwell and 135° inversion; stalls restored 20 mm cap, ambiguous recovery restored 130° minimum. Historical zero scores alone were not valid diagnoses.
+- 2026-10-10, v0.2 r21–23: repaired home-profile timing, rejected clipped/lower rims, and added continuous ring minima plus post-horizontal lowering.
+- 2026-10-10, v0.2 r24–26: widened chord allowance 2.5→3.5 mm, added terminal-clearance rejection/suggestions, finalized documentation; 179 tests passed, later retest 0/10.
+- 2026-10-10, earlier v0.2r2 r1–2: increased dwell to 1.60 s, chord allowance to 8.5 mm and minimum tilt to 135°. Fewer stops offset longer exposure; 179 tests passed.
+- 2026-10-10, earlier v0.2r2 r4–5: successful motion/home still failed capture; increased dwell to 1.80 s and minimum/default tilt to 140°, preserving tracking/clearance gates; 179 tests passed.
+- 2026-10-10, current r1, layout 0: caught missing requested_radius_m disabled lowering in all three failed cycles; added independent broad coaxial-section envelope radii, explicit radius source and missing/off-axis rejection; 181 tests passed.
+- 2026-10-10, current r2–5: layouts 0–3 passed at 710/710/713/695 ticks; retained tools and recorded successes, fit retries and terminal interruptions.
+- 2026-10-10, current r6, layout 4: timing rejection preceded a 28.5 mm destination shift and spill; added ≤4 read-only higher-grasp alternatives (10–40 mm), preserving endpoint and destination; 184 tests passed.
+- 2026-10-10, current r7, layout 4: raised shoulder grasp failed lift after 59 ticks; recovery displaced a receiver ~59 mm. Added three-ring monotonic-taper rejection and required supported timing suggestions; 187 tests passed.
+- 2026-10-10, current r8, layout 4: placement stopped at 2.105 mm after improving through 12 ticks. Added ≤4 extra ticks only within 10% of tolerance and still improving, retaining 2 mm/0.5° release gate/reserves; 189 tests passed.
+- 2026-10-10, current r9–10: layouts 4/5 passed at 711 ticks each; preserved tools and documented exact parameters and incomplete terminal recovery.
+- 2026-10-10, current r11, layout 6: raised grasp slipped ~37 mm while circular support was unknown. Added three matched depth-sector taper sections anchored by ≥2 lower-axis fits, ≥6 shared sectors and ≥80% monotonic narrowing agreement; 191 tests passed.
+- 2026-10-10, current r12–14: layouts 6/7/8 passed at 735/703/698 ticks. Layout 6 required 20 recovery ticks and an offset final request; this was not promoted to a targeting rule.
+- 2026-10-10, current r15, layout 9: timing rejection preceded a 30.6 mm destination shift and spill at 799 ticks. Removed mandatory horizontal stop while retaining 8.5 mm chord bound and continuous clearance; typical 124–134 mm tips use three rather than four segments/direction; 192 tests passed.
+- 2026-10-10, current r16: layout 9 passed at 262+255+183=700 ticks with final-source remeasurement; final replacement/home remained unverified.
+- 2026-10-10, current r17 final: distilled ten successful traces, corrected stale results/defaults, condensed dated history and the transfer interface; preserved runtime code and enabled tools. Documentation validation only; no evaluation/server run.
 
-- Final retest 2026-10-02 (official motion timing only; final tools, one run per layout, no optimizer): retest passed: 0 / 10
+- Final retest 2026-10-10 (final tools, one run per layout, no optimizer): retest passed: 9 / 10

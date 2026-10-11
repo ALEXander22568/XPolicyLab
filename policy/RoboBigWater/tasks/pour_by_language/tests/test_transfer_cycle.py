@@ -76,8 +76,18 @@ class API:
 
 
 class Tests(unittest.TestCase):
+    def setUp(self):
+        # These motion-only mocks have no rendered scene. Depth integration and
+        # failed acquisitions are covered separately in test_observed_transfer.
+        from unittest.mock import patch
+        self.endpoint_patch = patch.object(tool, 'observe_endpoint',
+            side_effect=lambda observation, expected: dict(
+                centre_world=np.asarray(expected).tolist(), radius_m=.012))
+        self.endpoint_patch.start()
+        self.addCleanup(self.endpoint_patch.stop)
+
     def test_default_entry_clears_tip_before_vertical_acquisition(self):
-        for pitch, shift in ((120, -.04), (-120, .04)):
+        for pitch, shift in ((140, -.04), (-140, .04)):
             args = self.args(pitch)
             args.pop('entry_offset')
             args['x'] += shift
@@ -105,24 +115,25 @@ class Tests(unittest.TestCase):
                 self.assertEqual(result['estimated_seconds'], estimate['estimated_seconds'])
 
     def test_default_exposure_is_sustained_and_budgeted(self):
-        for pitch in (-120, 120):
+        for pitch in (-140, 140):
             args = self.args(pitch)
             args.pop('dwell')
             args['reserve'] = 1.2
             estimate, code = tool.run(API(), 'transfer-estimate', args)
             self.assertEqual(code, 0)
-            explicit, code = tool.run(API(), 'transfer-estimate', dict(args, dwell=1.0))
+            explicit, code = tool.run(API(), 'transfer-estimate', dict(args, dwell=1.84))
             self.assertEqual(code, 0)
-            self.assertAlmostEqual(explicit['estimated_seconds'] - estimate['estimated_seconds'], .20)
+            self.assertAlmostEqual(explicit['estimated_seconds'] - estimate['estimated_seconds'], .04)
             short, code = tool.run(API(), 'transfer-estimate', dict(args, dwell=.12))
             self.assertEqual(code, 2)
             self.assertEqual(short['plan_fail_reason'], 'invalid_arguments')
             # Both parser-supplied and direct-call defaults must execute the
-            # minimum exposure; longer caller exposure remains supported.
+            # default exposure; explicit minimum and longer holds remain supported.
             schema = {a['name']: a.get('default') for a in tool.TOOL['commands'][0]['args']}
-            self.assertEqual(schema['dwell'], .80)
-            for supplied, ticks in ((args, 20), (dict(args, dwell=schema['dwell']), 20),
-                                    (dict(args, dwell=1.0), 25)):
+            self.assertEqual(schema['dwell'], 1.80)
+            for supplied, ticks in ((args, 45), (dict(args, dwell=schema['dwell']), 45),
+                                    (dict(args, dwell=1.80), 45),
+                                    (dict(args, dwell=1.84), 46)):
                 api = API()
                 result, code = tool.run(api, 'transfer-cycle', supplied)
                 self.assertEqual(code, 0, result)
@@ -131,7 +142,7 @@ class Tests(unittest.TestCase):
                 self.assertEqual(result['tilt_hold_steps'], ticks)
             # A budget that fit the old default must not admit the new hold.
             api = API()
-            api.sim_time_left = lambda: estimate['estimated_seconds'] + args['reserve'] - .24
+            api.sim_time_left = lambda: estimate['estimated_seconds'] + args['reserve'] - .16
             result, code = tool.run(api, 'transfer-cycle', args)
             self.assertEqual(code, 2)
             self.assertEqual(result['plan_fail_reason'], 'insufficient_time')
@@ -192,6 +203,77 @@ class Tests(unittest.TestCase):
             self.assertEqual(result['stages'][-1]['stage'], 'preplace')
             self.assertEqual(api.hand.gripper(), 0.)
             self.assertNotIn('replace', [s['stage'] for s in result['stages']])
+
+    def preplacement_api(self, residuals, distance=.0036, degrees=.47):
+        api = API()
+        move, hold = api.move_tcp, api.hold
+        api.staging_target = None
+        api.staging_ticks = 0
+        def residual(arm, target, feedback):
+            code = move(arm, target, feedback)
+            if np.allclose(target[:3, 3], [-.17, .03, .85]):
+                api.staging_target = target.copy()
+                angle = np.deg2rad(degrees)
+                rotation = np.array([[np.cos(angle), 0, np.sin(angle)],
+                                     [0, 1, 0], [-np.sin(angle), 0, np.cos(angle)]])
+                arm.pose[:3, :3] = rotation @ target[:3, :3]
+                arm.pose[2, 3] += distance
+            else:
+                api.staging_target = None
+            return code
+        def settle(steps):
+            if api.staging_target is not None:
+                self.assertEqual(api.hand.gripper(), 0.)
+                api.staging_ticks += steps
+                api.hand.pose[2, 3] = api.staging_target[2, 3] + residuals[
+                    min(api.staging_ticks, len(residuals))-1]
+            return hold(steps)
+        api.move_tcp, api.hold = residual, settle
+        return api
+
+    def test_preplacement_small_residual_settles_before_descent(self):
+        api = self.preplacement_api([.0028, .0019])
+        result, code = tool.run(api, 'transfer-cycle', self.args())
+        self.assertEqual(code, 0, result)
+        check = next(s for s in result['stages'] if s['stage'] == 'preplace')['preplace_check']
+        self.assertTrue(check['plan_ok'])
+        self.assertEqual(check['hold_steps'], 2)
+        self.assertEqual(api.staging_ticks, 2)
+
+    def test_preplacement_settling_is_bounded_and_preserves_gate(self):
+        for residuals, distance, degrees, ticks in (
+                ([.0036], .0036, .47, 4),
+                ([.006], .0036, .47, 1),
+                ([.001], .006, .47, 0),
+                ([.001], -.0021, .47, 0),
+                ([.001], .0036, .76, 0)):
+            api = self.preplacement_api(residuals, distance, degrees)
+            result, code = tool.run(api, 'transfer-cycle', self.args())
+            self.assertEqual(code, 2, result)
+            self.assertEqual(result['plan_detail'], 'preplacement_not_reached')
+            self.assertEqual(api.staging_ticks, ticks)
+            self.assertEqual(api.hand.gripper(), 0.)
+            self.assertNotIn('replace', [s['stage'] for s in result['stages']])
+
+    def test_preplacement_settling_checks_budget_and_reserve(self):
+        for reserve in (0., 2.):
+            api = self.preplacement_api([.001])
+            api.sim_time_left = lambda: reserve + .2 if api.staging_target is not None else 100.
+            result, code = tool.run(api, 'transfer-cycle', dict(self.args(), reserve=reserve))
+            self.assertEqual(code, 2, result)
+            self.assertEqual(result['plan_detail'], 'insufficient_time_for_preplacement_settling')
+            self.assertEqual(api.staging_ticks, 0)
+            self.assertEqual(api.hand.gripper(), 0.)
+
+    def test_preplacement_hold_failure_stops_closed(self):
+        api = self.preplacement_api([.001])
+        hold = api.hold
+        api.hold = lambda steps: False if api.staging_target is not None else hold(steps)
+        result, code = tool.run(api, 'transfer-cycle', self.args())
+        self.assertEqual(code, 2, result)
+        self.assertEqual(result['plan_detail'], 'episode ended')
+        self.assertEqual(api.hand.gripper(), 0.)
+        self.assertNotIn('replace', [s['stage'] for s in result['stages']])
 
     def placement_api(self, distance, degrees, settles):
         api = API()
@@ -299,6 +381,37 @@ class Tests(unittest.TestCase):
         self.assertGreater(window['end_error'], .9 * window['start_error'])
         self.assertLess(window['end_excess'], .9 * window['start_excess'])
         self.assertEqual(api.hand.gripper(), 1.)
+
+    def test_final_placement_window_finishes_recorded_near_miss(self):
+        # Recorded endpoints at ticks 4/8/12; intermediate and later values
+        # are synthetic convergence, not a replay of the physical episode.
+        prefix = [.002263779791] * 4 + [.002166153811] * 4 + [.002104901045] * 4
+        for pitch in (-140, 140):
+            api = self.converging_placement_api(prefix + [.00206, .00202, .00199],
+                                                initial=.002834422586)
+            result, code = tool.run(api, 'transfer-cycle', self.args(pitch))
+            self.assertEqual(code, 0, result)
+            check = next(s for s in result['stages'] if s['stage'] == 'replace')['placement_check']
+            self.assertEqual(check['hold_steps'], 15)
+            self.assertLessEqual(check['error_m'], .002)
+            self.assertTrue(check['progress_windows'][-1]['improving'])
+            self.assertEqual(api.hand.gripper(), 1.)
+
+    def test_final_placement_window_is_bounded_and_budgeted(self):
+        prefix = [.00226] * 4 + [.00216] * 4
+        cases = [(prefix + [.00216] * 8, False, 12, 'placement_not_settled'),
+                 (prefix + [.00210] * 8, False, 16, 'placement_not_settled'),
+                 (prefix + [.00210] * 4 + [.00199], True, 12,
+                  'insufficient_time_for_placement_settling')]
+        for errors, short_budget, ticks, reason in cases:
+            api = self.converging_placement_api(errors, initial=.00283)
+            if short_budget:
+                api.sim_time_left = lambda: .2 if api.closed_settles >= 12 else 100.
+            result, code = tool.run(api, 'transfer-cycle', self.args())
+            self.assertEqual(code, 2, result)
+            self.assertEqual(result['plan_detail'], reason)
+            self.assertEqual(api.closed_settles, ticks)
+            self.assertEqual(api.hand.gripper(), 0.)
 
     def test_near_tolerance_progress_followed_by_stall_stops_closed(self):
         api = self.converging_placement_api(
@@ -548,7 +661,7 @@ class Tests(unittest.TestCase):
         api.other.pose[:3, 3] = [shift, -.08, .90]
         args = dict(arm="right", x=.20+shift, y=0, z=.84,
                     tx=.16+shift, ty=-.14, tz=.84, tip=.14,
-                    pitch=120, entry_offset=.08, reserve=2)
+                    pitch=140, entry_offset=.08, reserve=2)
         return api, args
 
     def test_inactive_obstruction_retracted_before_active_motion(self):
@@ -619,13 +732,13 @@ class Tests(unittest.TestCase):
         with self.assertRaises(ValueError):
             tool.inactive_retreat(start, [("target", other[:3, 3], other[:3, :3])], other)
 
-    def args(self, pitch=120):
+    def args(self, pitch=140):
         return dict(arm="left", x=-.17, y=.03, z=.84, tx=.09, ty=-.12,
-                    tz=.93, tip=.11, pitch=pitch, clearance=.12, dwell=.80, entry_offset=0)
+                    tz=.93, tip=.11, pitch=pitch, clearance=.12, dwell=1.80, entry_offset=0)
 
     def lagging_tilt(self, recover):
         api = API()
-        args = dict(self.args(-120), dwell=.80)
+        args = dict(self.args(-140), dwell=1.80)
         estimate, _ = tool.run(api, "transfer-estimate", args)
         tilt_move = 1 + next(i for i, w in enumerate(estimate["waypoints"]) if w["stage"] == "tilt")
         base_move, base_hold = api.move_tcp, api.hold
@@ -651,9 +764,9 @@ class Tests(unittest.TestCase):
         api, args, _ = self.lagging_tilt(True)
         result, code = tool.run(api, "transfer-cycle", args)
         self.assertEqual(code, 0)
-        self.assertEqual(result["tilt_hold_steps"], 21)
+        self.assertEqual(result["tilt_hold_steps"], 46)
         dwell = next(s["dwell"] for s in result["stages"] if s["stage"] == "tilt")
-        self.assertEqual(dwell["stable_steps"], 20)
+        self.assertEqual(dwell["stable_steps"], 45)
 
     def test_stalled_tilt_stops_after_bounded_hold_without_reversal(self):
         api, args, tilt_move = self.lagging_tilt(False)
@@ -661,16 +774,16 @@ class Tests(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertEqual(result["plan_detail"], "tilt_not_settled")
         self.assertEqual(len(api.moves), tilt_move)
-        self.assertEqual(sum(api.holds), 26)
+        self.assertEqual(sum(api.holds), 51)
         self.assertEqual(api.hand.gripper(), 0.)
 
     def test_late_stable_dwell_finishes_without_relaxing_accuracy(self):
-        # At the 26-tick settling cap, 19/20 accurate intervals have
+        # At the 51-tick settling cap, 44/45 accurate intervals have
         # completed. Exercise both signs and loss of accuracy.
-        for pitch, lose_accuracy, scarce_time in ((120, False, False),
-                (-120, False, False), (120, True, False), (120, False, True)):
+        for pitch, lose_accuracy, scarce_time in ((140, False, False),
+                (-140, False, False), (140, True, False), (140, False, True)):
             api = API()
-            args = dict(self.args(pitch), dwell=.80)
+            args = dict(self.args(pitch), dwell=1.80)
             estimate, _ = tool.run(api, 'transfer-estimate', args)
             tilt_move = 1 + next(i for i, w in enumerate(estimate['waypoints'])
                                  if w['stage'] == 'tilt')
@@ -699,20 +812,20 @@ class Tests(unittest.TestCase):
                 alive = base_hold(steps)
                 if len(api.moves) == tilt_move:
                     ticks += steps
-                    residual(1.1 if ticks < 7 or (lose_accuracy and ticks == 27) else .968)
+                    residual(1.1 if ticks < 7 or (lose_accuracy and ticks == 52) else .968)
                 return alive
 
             api.move_tcp, api.hold = move, hold
-            api.sim_time_left = lambda: .04 if scarce_time and ticks >= 26 else 100.
+            api.sim_time_left = lambda: .04 if scarce_time and ticks >= 51 else 100.
             result, code = tool.run(api, 'transfer-cycle', args)
             if scarce_time:
                 self.assertEqual(result['plan_detail'], 'insufficient_time_for_tilt_settling')
-                self.assertEqual(ticks, 26)
+                self.assertEqual(ticks, 51)
             else:
                 dwell = next(s['dwell'] for s in result['stages'] if s['stage'] == 'tilt')
-                self.assertEqual(ticks, 27)
+                self.assertEqual(ticks, 52)
                 self.assertEqual(dwell['completion_ticks'], 1)
-                self.assertEqual(dwell['stable_steps'], 0 if lose_accuracy else 20)
+                self.assertEqual(dwell['stable_steps'], 0 if lose_accuracy else 45)
             self.assertEqual(code, 2 if lose_accuracy or scarce_time else 0, result)
             if code:
                 self.assertEqual(len(api.moves), tilt_move)
@@ -797,7 +910,7 @@ class Tests(unittest.TestCase):
         np.testing.assert_allclose(api.moves[-1][:3, 3], [-.17, .03, .84])
 
     def test_tip_compensation_both_directions_and_translations(self):
-        for pitch in (-140, -120, 120, 140):
+        for pitch in (-140, 140):
             a = self.args(pitch)
             for shift in (-.03, .04):
                 a["tx"] += shift
@@ -805,6 +918,32 @@ class Tests(unittest.TestCase):
                 np.testing.assert_allclose(pivot + rotation @ [0, 0, a["tip"]],
                                            [a["tx"], a["ty"], a["tz"]])
                 self.assertGreaterEqual(above[2], source[2] + a["clearance"])
+
+    def test_deeper_default_matches_estimate_and_executed_endpoint(self):
+        for command in tool.TOOL['commands']:
+            default = next(a['default'] for a in command['args'] if a['name'] == 'pitch')
+            self.assertEqual(default, 140)
+        for shift in (-.025, .04):
+            args = self.args()
+            args.pop('pitch')
+            args['x'] += shift
+            args['tx'] += shift
+            estimate_api, api = API(), API()
+            estimate, code = tool.run(estimate_api, 'transfer-estimate', args)
+            self.assertEqual(code, 0, estimate)
+            self.assertEqual(estimate_api.events, [])
+            result, code = tool.run(api, 'transfer-cycle', args)
+            self.assertEqual(code, 0, result)
+            self.assertEqual(result['estimated_seconds'], estimate['estimated_seconds'])
+            names = [w['stage'] for w in estimate['waypoints']]
+            tip_pose = api.moves[names.index('tilt')]
+            upright = api.moves[names.index('lift')][:3, :3]
+            relative = tip_pose[:3, :3] @ upright.T
+            self.assertAlmostEqual(np.degrees(np.arctan2(relative[0, 2], relative[0, 0])), 140)
+            np.testing.assert_allclose(tip_pose[:3, 3] + relative @ [0, 0, args['tip']],
+                                       [args['tx'], args['ty'], args['tz']], atol=1e-10)
+            self.assertGreaterEqual(result['tilt_hold_steps'], 45)
+            self.assertFalse(result['transfer_verified'])
 
     def test_cycle_restores_and_releases_before_retreat(self):
         api = API()
@@ -839,10 +978,10 @@ class Tests(unittest.TestCase):
     def test_shallow_or_zero_dwell_shortcuts_rejected_before_motion(self):
         for command in ("transfer-estimate", "transfer-cycle"):
             for pitch, dwell in ((-95, 0), (95, .12), (-110, .12), (110, .12),
-                                 (-119.9, .60), (119.9, 2), (120, .12), (-120, .599), (-120, .60), (120, .799), (120, 0), (120, .119), (120, -.1)):
+                                 (-119.9, .60), (119.9, 2), (140, .12), (-140, .599), (-140, .60), (140, .799), (140, 0), (140, .119), (140, -.1)):
                 api = API()
                 a = self.args(pitch)
-                a.update(dwell=dwell, tz=.85, tip=.135, clearance=.06,
+                a.update(dwell=dwell, tz=.85, tip=.130, clearance=.06,
                          entry_offset=.08, travel_pitch=0)
                 result, code = tool.run(api, command, a)
                 self.assertEqual(code, 2)
@@ -850,9 +989,37 @@ class Tests(unittest.TestCase):
                 self.assertEqual(api.moves, [])
                 self.assertEqual(api.grips, [])
 
+    def test_explicit_short_dwell_rejected_before_observation_or_motion(self):
+        from unittest.mock import Mock
+        for command in ('transfer-estimate', 'transfer-cycle'):
+            for pitch in (-140, 140):
+                for dwell in (.8, .96, 1.10, 1.60, 1.799999, 2.000001, float('nan'), float('inf')):
+                    with self.subTest(command=command, pitch=pitch, dwell=dwell):
+                        api = API()
+                        api.observe = Mock(side_effect=AssertionError('unexpected observation'))
+                        result, code = tool.run(api, command, dict(self.args(pitch), dwell=dwell))
+                        self.assertEqual(code, 2)
+                        self.assertEqual(result['plan_fail_reason'], 'invalid_arguments')
+                        self.assertEqual(api.events, [])
+                        api.observe.assert_not_called()
+
+    def test_explicit_old_pitch_and_new_boundary_rejected_without_actions(self):
+        for command in ('transfer-estimate', 'transfer-cycle'):
+            for pitch in (-120, 120, -125, 125, -130, 130, -135, 135, -137.5, 137.5, -139.999, 139.999, -140.001, 140.001):
+                with self.subTest(command=command, pitch=pitch):
+                    from unittest.mock import Mock
+                    api = API()
+                    api.observe = Mock(side_effect=AssertionError('invalid request observed scene'))
+                    result, code = tool.run(api, command, self.args(pitch))
+                    self.assertEqual(code, 2)
+                    self.assertEqual(result['plan_fail_reason'], 'invalid_arguments')
+                    self.assertIn('pitch must be 140 degrees', result['plan_detail'])
+                    self.assertEqual(api.events, [])
+                    api.observe.assert_not_called()
+
     def test_nonzero_transport_rejected_without_side_effects(self):
         for command in ("transfer-estimate", "transfer-cycle"):
-            for pitch in (-120, 120):
+            for pitch in (-140, 140):
                 for travel in (-60, -.001, .001, 30, 60, 60.001, 85, float("inf"), float("nan")):
                     api = API()
                     args = dict(self.args(pitch), travel_pitch=travel)
@@ -864,8 +1031,8 @@ class Tests(unittest.TestCase):
 
     def test_success_reports_motion_only(self):
         api = API()
-        a = self.args(-120)
-        a["dwell"] = .80
+        a = self.args(-140)
+        a["dwell"] = 1.80
         result, code = tool.run(api, "transfer-cycle", a)
         self.assertEqual(code, 0)
         self.assertEqual(result["completion_scope"], "motion_only")
@@ -894,7 +1061,7 @@ class Tests(unittest.TestCase):
         self.assertEqual(api.moves[0][2, 3], 1.18)
 
     def test_full_inversion_stays_at_target_for_both_signs(self):
-        for pitch in (-120, 120):
+        for pitch in (-140, 140):
             travel = 0
             api = API()
             a = self.args(pitch)
@@ -912,7 +1079,7 @@ class Tests(unittest.TestCase):
                                        [a["tx"], a["ty"], a["tz"]])
 
     def test_recovery_stays_over_target_before_leaving(self):
-        for pitch in (-120, 120):
+        for pitch in (-140, 140):
             travel = 0
             for shift in (-.04, .04):
                 api = API()
@@ -926,7 +1093,7 @@ class Tests(unittest.TestCase):
                 stages = list(poses)
                 self.assertTrue(stages[stages.index("tilt")+1].startswith("recover_segment_"))
                 self.assertEqual(stages[stages.index("untilt")+1], "return_above")
-                self.assertEqual(result["tilt_hold_steps"], 20)
+                self.assertEqual(result["tilt_hold_steps"], 45)
                 self.assertEqual(result["recovery_pitch"], min(travel, 60))
                 tip = poses["untilt"][:3, 3] + args["tip"]*poses["untilt"][:3, 2]
                 self.assertAlmostEqual(tip[1], args["ty"])
@@ -955,7 +1122,7 @@ class Tests(unittest.TestCase):
         cases = ((.12, .0076, 1.05, True), (.12, .009, 1.9, True),
                  (.12, 0., 2.1, False), (.30, .009, 1.9, False),
                  (.12, .0101, 0., False))
-        for pitch in (-120, 120):
+        for pitch in (-140, 140):
             for length, distance, degrees, accepted in cases:
                 with self.subTest(pitch=pitch, length=length, degrees=degrees, distance=distance):
                     api = API()
@@ -997,7 +1164,7 @@ class Tests(unittest.TestCase):
     def test_lower_target_does_not_raise_source_lift(self):
         api = API()
         a = self.args()
-        a.update(tz=.83, z=.85, tip=.135, clearance=.06)
+        a.update(tz=.83, z=.85, tip=.130, clearance=.06)
         result, code = tool.run(api, "transfer-cycle", a)
         self.assertEqual(code, 0)
         poses = {s["stage"]: p for s, p in zip(result["stages"], api.moves)}
@@ -1007,7 +1174,7 @@ class Tests(unittest.TestCase):
         self.assertAlmostEqual(above[2], .91)
 
     def test_low_target_retains_clearance_until_horizontal_in_both_directions(self):
-        for pitch in (-140, -120, 120, 140):
+        for pitch in (-140, 140):
             for dx, dz in ((0., 0.), (.035, .04)):
                 args = dict(self.args(pitch), z=.85+dz, tz=.825+dz,
                             tip=.1337, clearance=.06, entry_offset=0)
@@ -1036,7 +1203,7 @@ class Tests(unittest.TestCase):
     def test_rotation_margin_outside_workspace_rejected_before_motion(self):
         for command in ('transfer-estimate', 'transfer-cycle'):
             api = API()
-            args = dict(self.args(120), z=1.2, clearance=.24, tz=1.2)
+            args = dict(self.args(140), z=1.2, clearance=.24, tz=1.2)
             result, code = tool.run(api, command, args)
             self.assertEqual(code, 2)
             self.assertEqual(result['plan_fail_reason'], 'invalid_arguments')
@@ -1044,7 +1211,7 @@ class Tests(unittest.TestCase):
             self.assertEqual(api.events, [])
 
     def test_segmented_arc_bounds_tip_drift_before_and_after_horizontal(self):
-        for pitch in (-140, -120, 120, 140):
+        for pitch in (-140, 140):
             travel = 0
             for length in (.02, .122, .144, .30):
                 api = API()
@@ -1056,7 +1223,7 @@ class Tests(unittest.TestCase):
                 names = [s['stage'] for s in result['stages']]
                 arc = api.moves[names.index('aim'):names.index('untilt')+1]
                 angles = [np.degrees(np.arctan2(p[0, 2], p[2, 2])) for p in arc]
-                self.assertTrue(any(abs(abs(v)-90) < 1e-8 for v in angles))
+                self.assertTrue(any(abs(v) > 90 for v in angles))
                 for p in arc:
                     tip = p[:3, 3]+length*p[:3, 2]
                     np.testing.assert_allclose(tip[:2], [a['tx'], a['ty']], atol=1e-10)
@@ -1067,13 +1234,13 @@ class Tests(unittest.TestCase):
                     for f in np.linspace(0, 1, 301):
                         xyz = (1-f)*p[:3, 3]+f*q[:3, 3]
                         angle = np.deg2rad((1-f)*low+f*high)
-                        self.assertLessEqual(abs(xyz[0]+length*np.sin(angle)-a['tx']), .0025+1e-10)
+                        self.assertLessEqual(abs(xyz[0]+length*np.sin(angle)-a['tx']), .0085+1e-10)
                         self.assertAlmostEqual(xyz[1], a['ty'])
 
     def test_shorter_tip_uses_fewer_stops_with_same_error_bound(self):
         counts = []
         for length in (.122, .30):
-            args = dict(self.args(120), tip=length, tz=1.02)
+            args = dict(self.args(140), tip=length, tz=1.02)
             result, code = tool.run(API(), 'transfer-estimate', args)
             self.assertEqual(code, 0, result)
             counts.append(sum(w['stage'].startswith(('tilt', 'recover_segment'))
@@ -1084,19 +1251,21 @@ class Tests(unittest.TestCase):
 
     def test_curvature_partition_preserves_bound_across_supported_geometry(self):
         for length in np.linspace(.02, .30, 29):
-            for pitch in (120, 127, 140):
+            for pitch in (135, 127, 140):
                 angles = np.radians(tool.compensated_angles(length, pitch))
                 self.assertEqual(angles[0], 0.)
                 self.assertAlmostEqual(angles[-1], np.radians(pitch))
-                self.assertTrue(any(abs(a-np.pi/2) < 1e-12 for a in angles))
+                self.assertTrue(any(a > np.pi/2 for a in angles))
                 for a, b in zip(angles, angles[1:]):
                     self.assertGreater(b, a)
                     f = np.linspace(0., 1., 2001)
                     gap = length * (np.sin(a+(b-a)*f)
                                     - (1-f)*np.sin(a)-f*np.sin(b))
-                    self.assertLessEqual(np.max(np.abs(gap)), .0025)
-        # Archived measured length: six moves each way instead of seven.
-        self.assertEqual(len(tool.compensated_angles(.1337, 120))-1, 6)
+                    self.assertLessEqual(np.max(np.abs(gap)), .0085)
+        # Fewer acceleration/braking stops, with a fixed public 8.5 mm bound.
+        self.assertEqual(tool.XY_CHORD_BOUND, .0085)
+        for length in (.12367, .13367, .14367):
+            self.assertEqual(len(tool.compensated_angles(length, 130))-1, 3)
 
     def test_arc_tracking_failure_stops_closed_without_retry(self):
         args = self.args()
@@ -1121,7 +1290,7 @@ class Tests(unittest.TestCase):
     def test_default_transport_is_upright_in_both_directions(self):
         # Compare the actual path rotations, including mirrored and translated
         # requests. This is geometric evidence, not a fluid-retention test.
-        for pitch in (-120, 120):
+        for pitch in (-140, 140):
             for shift in (-.04, .04):
                 args = self.args(pitch)
                 args["x"] += shift
@@ -1145,7 +1314,7 @@ class Tests(unittest.TestCase):
                 for name in ("tilt",):
                     tip = poses[name][:3, 3] + args["tip"] * poses[name][:3, 2]
                     np.testing.assert_allclose(tip[:2], [args["tx"], args["ty"]])
-                self.assertEqual(result["tilt_hold_steps"], 20)
+                self.assertEqual(result["tilt_hold_steps"], 45)
                 self.assertFalse(result["transfer_verified"])
         defaults = {a["name"]: a.get("default") for a in tool.TOOL["commands"][0]["args"]}
         self.assertEqual(defaults["travel_pitch"], result["travel_pitch"])
@@ -1167,7 +1336,7 @@ class Tests(unittest.TestCase):
         self.assertEqual(api.hand.gripper(), 1.)
 
     def test_open_fingers_insert_and_withdraw_horizontally(self):
-        for offset, dz, pitch in ((.08, 0., -120), (.15, .06, 120)):
+        for offset, dz, pitch in ((.08, 0., -140), (.15, .06, 140)):
             api = API()
             a = dict(self.args(pitch), entry_offset=offset)
             a['z'] += dz
@@ -1212,7 +1381,7 @@ class Tests(unittest.TestCase):
         for sign in (-1, 1):
             for shift in (-.07, .08):
                 api = API()
-                a = self.args(120 * sign)
+                a = self.args(140 * sign)
                 a.update(x=shift, y=.02, z=.85, tx=shift-.16*sign,
                          ty=-.12, tz=.82, tip=.13, clearance=.06,
                          entry_offset=.08)
@@ -1281,7 +1450,7 @@ class Tests(unittest.TestCase):
 
     def test_aim_configuration_failure_splits_once_and_completes(self):
         api = API()
-        a = self.args(-120)
+        a = self.args(-140)
         estimate, _ = tool.run(api, "transfer-estimate", a)
         api.fail_at = 1 + next(i for i, w in enumerate(estimate["waypoints"]) if w["stage"] == "aim")
         result, code = tool.run(api, "transfer-cycle", a)
@@ -1343,7 +1512,7 @@ class Tests(unittest.TestCase):
         self.assertEqual(len(api.moves), aim)
         self.assertEqual(api.grips, [0.])
 
-    def test_split_rejects_insufficient_remaining_time(self):
+    def test_post_lift_budget_rejects_before_unaffordable_aim(self):
         api = API()
         a = self.args()
         estimate, _ = tool.run(api, "transfer-estimate", a)
@@ -1352,8 +1521,8 @@ class Tests(unittest.TestCase):
         api.sim_time_left = lambda: .01 if len(api.moves) >= aim-1 else 100.
         result, code = tool.run(api, "transfer-cycle", a)
         self.assertEqual(code, 2)
-        self.assertEqual(result["plan_detail"], "insufficient_time_for_split_aim")
-        self.assertEqual(len(api.moves), aim)
+        self.assertEqual(result["plan_detail"], "insufficient_time_for_observed_correction")
+        self.assertEqual(len(api.moves), aim-1)
         self.assertEqual(api.grips, [0.])
 
 
@@ -1362,6 +1531,8 @@ if __name__ == "__main__":
 
 
 class TimingContractTests(unittest.TestCase):
+    setUp = Tests.setUp
+
     def test_estimate_is_explicitly_not_a_lower_bound(self):
         api = API()
         result, code = tool.run(api, 'transfer-estimate', dict(

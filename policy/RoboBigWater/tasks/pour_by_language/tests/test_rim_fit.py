@@ -1,6 +1,7 @@
 import importlib.util
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 import numpy as np
 
 spec = importlib.util.spec_from_file_location('rim_fit', Path(__file__).parents[1]/'tools/rim_fit/tool.py')
@@ -15,6 +16,59 @@ def ring(centre, radius=.05, arc=360):
 
 
 class Tests(unittest.TestCase):
+    def test_partial_upper_arc_does_not_fall_back_to_lower_wall(self):
+        points = np.vstack((ring([0, 0, .8], .045), ring([0, 0, .81], .052, 150)))
+        # The shared fitter alone accepts the lower complete section.
+        self.assertAlmostEqual(tool.fit_rim(points)['rim_z'], .8)
+        def locate(observation, args, fitter, model_name):
+            return fitter(points)
+        class API:
+            def observe(self):
+                return {}
+        with patch.object(tool.axis, 'locate', side_effect=locate):
+            result, code = tool.run(API(), 'rim-fit', dict(u=100, v=100))
+        self.assertEqual(code, 2)
+        self.assertIn('above candidate', result['plan_detail'])
+        self.assertNotIn('centre_world', result)
+
+    def test_interior_seed_finds_lip_and_rejects_clipped_wall(self):
+        # Render a tapered interior from an oblique camera. The seed is on
+        # its floor, 30 mm below the lip; a 15 mm crop contains only wall.
+        for centre in (np.array([-.17, -.08, .77]), np.array([.13, .04, .96])):
+            eye = centre + [0, -.5, .5]
+            forward = centre-eye
+            forward /= np.linalg.norm(forward)
+            right = np.cross(forward, [0, 0, 1])
+            right /= np.linalg.norm(right)
+            rotation = np.column_stack((right, np.cross(forward, right), forward))
+            v, u = np.mgrid[:200, :200]
+            rays = np.stack(((u-100)/400, (v-100)/400, np.ones_like(u)), axis=-1)@rotation.T
+            depth = np.full(u.shape, np.inf)
+            for height in np.linspace(0, .03, 121):
+                distance = (centre[2]+height-eye[2])/rays[..., 2]
+                points = eye+distance[..., None]*rays
+                radial = np.linalg.norm(points[..., :2]-centre[:2], axis=-1)
+                radius = .035 + height*2/3
+                visible = radial <= radius if height == 0 else abs(radial-radius) <= .0006
+                depth = np.minimum(depth, np.where(visible, distance, np.inf))
+            depth[~np.isfinite(depth)] = np.nan
+            transform = np.eye(4)
+            transform[:3, :3], transform[:3, 3] = rotation, eye
+            observation = dict(depth={'cam_head': depth}, cameras={'cam_head': dict(
+                intrinsics=[[400, 0, 100], [0, 400, 100], [0, 0, 1]],
+                extrinsics_world=transform)})
+            class API:
+                def observe(self):
+                    return observation
+            args = dict(u=100, v=100, window=100)
+            result, code = tool.run(API(), 'rim-fit', args)
+            self.assertEqual(code, 0, result)
+            np.testing.assert_allclose(result['centre_world'], centre+[0, 0, .03], atol=.002)
+            clipped, code = tool.run(API(), 'rim-fit', dict(args, band=.015))
+            self.assertEqual(code, 2, clipped)
+            self.assertEqual(clipped['plan_fail_reason'], 'rim_search_clipped')
+            self.assertNotIn('centre_world', clipped)
+
     def test_translated_noisy_rims_with_lower_interior(self):
         rng = np.random.default_rng(32)
         for centre in ((-.2, -.1, .85), (.15, .06, 1.02)):

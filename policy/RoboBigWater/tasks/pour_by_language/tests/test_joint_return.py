@@ -51,6 +51,71 @@ class API:
 
 
 class Tests(unittest.TestCase):
+    def public_api(self, distance=1.92, remaining=1.):
+        # Use the public helper itself, not a replica of its timing equations.
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+        from roboshell.server import motion
+        api = API()
+        api.motion = motion
+        api.arms["left"] = Arm(distance)
+        api.remaining = remaining
+        return api
+
+    def test_public_home_fallback_fits_recorded_deadline(self):
+        for distance in np.linspace(1.90, 1.936, 12):
+            api = self.public_api(distance)
+            result, code = tool.run(api, "joint-return-estimate", {"arm": "both"})
+            self.assertEqual(code, 0)
+            self.assertEqual(result["nominal_steps"], 37)
+            self.assertEqual(result["trajectory_profile"], "public_home_time_path")
+            self.assertEqual(result["minimum_steps"], 24)
+            self.assertTrue(result["fits_budget"])
+            self.assertEqual(api.calls, [])
+            result, code = tool.run(api, "joint-return", {"arm": "both"})
+            self.assertEqual(code, 0, result)
+            self.assertTrue(result["joint_return_verified"])
+            self.assertEqual(result["executed_steps"], 24)
+            self.assertEqual(result["remaining_steps"], 1)
+            self.assertEqual(len(api.calls), 1)
+            for tag, path in api.calls[0].items():
+                start = Arm(distance if tag == "left" else .7).joints()
+                velocity = np.diff(np.vstack([start, path]), axis=0) * 25
+                acceleration = np.diff(np.vstack([np.zeros(3), velocity, np.zeros(3)]), axis=0) * 25
+                self.assertLessEqual(abs(velocity).max(), api.motion.MAX_JOINT_SPEED + 1e-9)
+                self.assertLessEqual(abs(acceleration).max(), api.motion.MAX_JOINT_ACCEL + 1e-9)
+
+    def test_public_fallback_rejects_short_budget_and_tracking_error(self):
+        for remaining in (.96, .999999):
+            api = self.public_api(remaining=remaining)
+            result, code = tool.run(api, "joint-return", {"arm": "both"})
+            self.assertEqual(code, 2)
+            self.assertEqual(result["plan_fail_reason"], "insufficient_time")
+            self.assertEqual(api.calls, [])
+        api = self.public_api()
+        api.error = .021
+        result, code = tool.run(api, "joint-return", {"arm": "both"})
+        self.assertEqual(code, 2)
+        self.assertEqual(result["plan_fail_reason"], "joint_tracking_error")
+        self.assertFalse(result["joint_return_verified"])
+        self.assertEqual(len(api.calls), 1)
+
+    def test_public_fallback_invalid_path_never_moves(self):
+        from types import SimpleNamespace
+        for path in (np.zeros((0, 3)), np.full((2, 3), np.nan), np.ones((2, 4)), np.ones((2, 3))):
+            api = self.public_api()
+            api.motion = SimpleNamespace(time_path=lambda _: path, MAX_JOINT_ACCEL=10.)
+            result, code = tool.run(api, "joint-return", {"arm": "both"})
+            self.assertEqual(code, 2)
+            self.assertEqual(result["plan_fail_reason"], "invalid_arguments")
+            self.assertEqual(api.calls, [])
+
+    def test_public_helper_does_not_replace_feasible_local_profile(self):
+        api = self.public_api(remaining=32.)
+        result, code = tool.run(api, "joint-return", {"arm": "both"})
+        self.assertEqual(code, 0)
+        self.assertEqual(result["trajectory_profile"], "local_trapezoid")
+
     def test_return_exposes_redundant_home_timeout_at_recorded_budget(self):
         for distance in np.linspace(1.974, 2.053, 30):
             api = API()

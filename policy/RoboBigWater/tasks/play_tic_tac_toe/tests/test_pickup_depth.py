@@ -25,6 +25,40 @@ class DepthAPI(API):
 
 
 class PickupDepthTests(unittest.TestCase):
+    def test_depth_center_detects_offset_and_preserves_contact_height(self):
+        api = DepthAPI()
+        for offset in (-.01, 0., .01):
+            api.offset = offset
+            source = np.array([0., 0., .03])
+            view = transfer.source_relief(api, source)
+            check = transfer.source_alignment(source, view, 'down')
+            self.assertTrue(check['checked'])
+            self.assertEqual(check['misaligned'], offset != 0.)
+            np.testing.assert_allclose(check['suggested_source'], [0., offset, .03], atol=.001)
+
+    def test_cropped_relief_and_tilt_do_not_infer_alignment(self):
+        api = DepthAPI()
+        source = np.array([0., -.03, .03])
+        view = transfer.source_relief(api, source)
+        self.assertFalse(transfer.source_alignment(source, view, 'down')['checked'])
+        source[1] = .01
+        view = transfer.source_relief(api, source)
+        self.assertFalse(transfer.source_alignment(source, view, 'down45')['checked'])
+
+    def test_misalignment_rejects_both_commands_before_motion(self):
+        view = transfer.source_relief(DepthAPI(), np.array([0., .01, .03]))
+        for command in ('vertical-transfer', 'deposit-transfer'):
+            api = API(); transfer._reference = None
+            api.estimate['transfer_action_steps'] = 90
+            args = dict(arm='left', x=0., y=.01, z=.03, to_x=.15, to_y=0., to_z=.04)
+            with patch.object(transfer, 'source_relief', return_value=view):
+                result, code = transfer.run(api, command, args)
+            self.assertEqual(code, 2)
+            self.assertEqual(result['plan_fail_reason'], 'source_center_misaligned')
+            self.assertEqual(api.calls, [])
+            self.assertFalse(result['released'])
+            self.assertIn('suggested_source', result['alignment_check'])
+
     def test_translated_missed_pickup_still_detected(self):
         api = DepthAPI(); source = np.array([0., -.02, .03])
         baseline = transfer.source_relief(api, source)

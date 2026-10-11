@@ -1,8 +1,9 @@
 """Depth verification must carry neutral geometry and stop empty grasps."""
 import unittest
+from unittest.mock import patch
 import cv2
 import numpy as np
-from tool import run, visible_cloud, depth_lift, corridor_clearance
+from tool import run, visible_cloud, depth_lift, depth_baselines, corridor_clearance
 from test_transfer import API, observation
 import test_transfer
 from test_clearance import scene
@@ -18,6 +19,56 @@ def neutral(z, shift=None):
 
 
 class DepthTransferTest(unittest.TestCase):
+    def test_opposite_visible_faces_need_independent_baselines(self):
+        # Two cameras see disjoint faces. Neither cloud can register to the
+        # opposite face, even though both belong to the same rigid body.
+        x, z = np.meshgrid(np.linspace(-.025, .025, 25), np.linspace(.79, .815, 20))
+        front = np.column_stack((x.ravel(), np.full(x.size, -.022), z.ravel()))
+        back = front.copy()
+        back[:, 1] = .022
+        for shift in (np.zeros(3), np.array([.23, -.17, .12])):
+            before = {'cameras': {'cam_head': {}, 'wrist': {}, 'missing': {}}}
+            after = {'cameras': before['cameras']}
+            def clouds(obs, camera, color, xy, radius, bounds=None):
+                if camera != 'wrist':
+                    raise ValueError('occluded')
+                cloud = back + shift + ([0., 0., .04] if obs is after else 0.)
+                return cloud.copy()
+            with patch('tool.visible_cloud', side_effect=clouds):
+                baselines = depth_baselines(before, 'head', shift[:2], .045,
+                                            .765+shift[2], front+shift)
+                self.assertEqual(set(baselines), {'cam_head', 'wrist'})
+                # The old cross-view-only comparison cannot verify this lift.
+                self.assertFalse(depth_lift(front+shift, after, 'head', shift[:2],
+                                           .045, .04, .765+shift[2])['verified'])
+                result = depth_lift(front+shift, after, 'head', shift[:2], .045,
+                                    .04, .765+shift[2], baselines)
+                self.assertTrue(result['verified'], result)
+                self.assertEqual(result['attempts'][-1]['baseline_camera'], 'wrist')
+                # A stationary alternate face cannot certify an empty grasp.
+                result = depth_lift(front+shift, before, 'head', shift[:2], .045,
+                                    .04, .765+shift[2], baselines)
+                self.assertFalse(result['verified'], result)
+
+    def test_multiview_capture_precedes_all_motion(self):
+        api = API()
+        def observe():
+            obs = neutral(.9 if api.grips else .8)
+            for key in ('png', 'depth', 'cameras'):
+                obs[key]['wrist'] = obs[key]['cam_head']
+            return obs
+        api.observe = observe
+        original = depth_baselines
+        def capture(*args):
+            self.assertEqual(api.moves, [])
+            self.assertEqual(api.grips, [])
+            return original(*args)
+        with patch('tool.depth_baselines', side_effect=capture) as captured:
+            result, code = run(api, 'guarded_transfer',
+                               dict(test_transfer.TransferTest.args, color='surface'))
+        self.assertEqual(code, 0, result)
+        self.assertEqual(captured.call_count, 1)
+
     def test_neutral_transfer_and_translated_scene(self):
         for shift in (np.zeros(3), np.array([.13, -.09, .12])):
             api = API()

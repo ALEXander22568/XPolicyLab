@@ -149,7 +149,33 @@ def run(api, command, args):
                                         planned_steps + HEADROOM_STEPS > available_steps)
         reserve_steps = 1 if deadline_limited else RESERVE_STEPS
         minimum_steps = planned_steps - SETTLE_STEPS + MIN_SETTLE_STEPS if adaptive else planned_steps
+        profile = "local_trapezoid"
+        # Match the base command's current timing when the historical local
+        # speed cap cannot meet the deadline. Only public joint paths are used;
+        # select before motion, and retain measured settling and a live tick.
+        time_path = getattr(getattr(api, "motion", None), "time_path", None)
+        if minimum_steps + reserve_steps > available_steps and callable(time_path):
+            server_sequences = {}
+            for tag in tags:
+                path = np.asarray(time_path(np.stack([starts[tag], targets[tag]])), dtype=float)
+                if (path.ndim != 2 or path.shape[0] == 0
+                        or path.shape[1:] != targets[tag].shape
+                        or not np.isfinite(path).all()
+                        or not np.allclose(path[-1], targets[tag], atol=1e-9, rtol=0)):
+                    raise ValueError("invalid public home trajectory")
+                server_sequences[tag] = np.vstack([
+                    path, np.repeat(targets[tag][None], SETTLE_STEPS, axis=0)])
+            server_steps = max(map(len, server_sequences.values()))
+            if server_steps - SETTLE_STEPS + MIN_SETTLE_STEPS + 1 <= available_steps:
+                sequences = server_sequences
+                planned_steps = server_steps
+                minimum_steps = planned_steps - SETTLE_STEPS + MIN_SETTLE_STEPS
+                seconds = planned_steps / HZ
+                adaptive, reserve_steps = True, 1
+                profile = "public_home_time_path"
+                acceleration = float(api.motion.MAX_JOINT_ACCEL)
         feedback = {"plan_ok": True, "plan_fail_reason": None,
+                    "trajectory_profile": profile,
                     "acceleration_limit_rad_s2": acceleration,
                     "nominal_steps": nominal_steps,
                     "planned_seconds": seconds, "reserve_seconds": reserve_steps / HZ,

@@ -110,7 +110,35 @@ class API:
 
 
 class TransferTest(unittest.TestCase):
-    args = dict(arm='left', x=0., y=0., z=.8, to_x=.2, to_y=-.2, to_z=.8, color='yellow', clearance=.1)
+    args = dict(arm='left', x=0., y=0., z=.8, to_x=.2, to_y=-.2, to_z=.8, color='yellow', clearance=.1, approach='down', open='x')
+
+    def test_blocked_approach_reports_reach_without_motion_or_duplicate_work(self):
+        from unittest.mock import patch
+        import json
+        from tool import execution_profiles
+        api = API()
+        def repeated_profiles(*args):
+            profiles = execution_profiles(*args)
+            return profiles * 4
+        scene_failure = dict(plan_ok=False, plan_fail_reason='scene_in_approach_path',
+                             failed_stage='orient', scene_pixels=545)
+        reach_failure = dict(plan_ok=False, plan_fail_reason='preflight_unreachable',
+                             failed_stage='carry')
+        with patch('tool.execution_profiles', side_effect=repeated_profiles), patch(
+                'tool.approach_scene_clearance', return_value=scene_failure) as scene, patch(
+                'tool.preflight_path', return_value=reach_failure) as reach:
+            out, code = run(api, 'transfer_plan', dict(self.args, route='direct'))
+        self.assertEqual(code, 2)
+        self.assertEqual(out['plan_fail_reason'], 'scene_in_approach_path')
+        preflight = out['preflight']
+        self.assertEqual(preflight['diagnostic_kinematics']['failed_stage'], 'carry')
+        self.assertEqual(reach.call_count, 1)
+        self.assertLess(scene.call_count, preflight['attempt_count'])
+        self.assertEqual(sum(a['occurrences'] for a in preflight['route_attempts']),
+                         preflight['attempt_count'])
+        self.assertLess(len(json.dumps(out)), 6000)
+        self.assertEqual(api.moves, [])
+        self.assertEqual(api.grips, [])
 
     def test_withdraw_clears_translated_top_and_is_preflighted(self):
         for destination_z in (.78, .82):

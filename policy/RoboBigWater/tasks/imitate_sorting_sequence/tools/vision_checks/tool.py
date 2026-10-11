@@ -1,9 +1,38 @@
 """Camera-only geometry and bounded visual settling checks."""
 import io
 import math
+import sys
+import types
+import weakref
+from pathlib import Path
 
 import numpy as np
 from PIL import Image
+
+
+# Registry and sibling tools load this file under different module names.
+# Share only tool-owned initialization evidence, scoped to this task path.
+_cache_key = "roboshell_quiet_cache:" + str(Path(__file__).resolve())
+_cache = sys.modules.setdefault(_cache_key, types.ModuleType(_cache_key))
+if not hasattr(_cache, "completed"):
+    _cache.completed = weakref.WeakKeyDictionary()
+_completed_transfers = _cache.completed
+
+
+def continuation_ready(api):
+    try:
+        left, right = api.arm("left"), api.arm("right")
+        saved = _completed_transfers.get(left)
+        now = api.sim_time_left()
+        ready = bool(not api.over and saved and saved[0]() is right
+                     and math.isfinite(now) and 0 <= now <= saved[1] + 1e-8)
+        if ready:
+            _completed_transfers[left] = (saved[0], now)
+        else:
+            _completed_transfers.pop(left, None)
+        return ready
+    except Exception:
+        return False
 
 
 CAMERAS = {"head": "cam_head", "wrist_l": "cam_left_wrist", "wrist_r": "cam_right_wrist"}
@@ -25,7 +54,7 @@ TOOL = {"name": "vision_checks", "commands": [
          {"name": "arm", "positional": True, "choices": ["left", "right"]},
          {"name": "preset", "positional": True, "choices": ["down", "down45"]},
          {"name": "open", "default": "x", "choices": ["x", "y"]},
-         {"name": "quiet", "type": "float", "default": 2.0},
+         {"name": "quiet", "type": "float", "default": 0.0},
          {"name": "timeout", "type": "float", "default": 6.0}]},
 ]}
 
@@ -98,13 +127,17 @@ def changed_pixels(anchor, current):
 
 def point_still(api, args):
     started = None
+    consumed = False
+    succeeded = False
+    saved = None
     try:
         tag, preset, axis = args.get("arm"), args.get("preset"), args.get("open", "x")
-        quiet, timeout = float(args.get("quiet", 2)), float(args.get("timeout", 6))
+        quiet, timeout = float(args.get("quiet", 0)), float(args.get("timeout", 6))
         if tag not in ("left", "right") or preset not in ("down", "down45") or axis not in ("x", "y"):
             return fail("invalid_arm_preset_or_open_axis")
-        if not (math.isfinite(quiet) and math.isfinite(timeout) and 2 <= quiet <= timeout <= 10):
-            return fail("require_2_le_quiet_le_timeout_le_10")
+        if not (math.isfinite(quiet) and math.isfinite(timeout) and 2 <= timeout <= 10
+                and (quiet == 0 or 2 <= quiet <= timeout)):
+            return fail("require_quiet_0_or_2_le_quiet_le_timeout_le_10")
         if api.over:
             return fail("episode_over")
         arm = api.arm(tag)
@@ -113,8 +146,15 @@ def point_still(api, args):
             return fail("invalid_tcp_pose")
         target[:3, :3] = rotation(preset, axis, target[:3, :3])
         started = api.sim_time_left()
+        continuation = continuation_ready(api)
+        if quiet == 0:
+            quiet = .4 if continuation else 2.
+        # Consume before waiting; any gate/motion failure invalidates evidence.
+        saved = _completed_transfers.pop(api.arm("left"), None)
+        consumed = True
         # Keep the entire fixed camera in view: a quiet crop can hide movement.
         check, code = run(api, "wait-still", {"camera": "head", "quiet": quiet, "timeout": timeout})
+        check["gate_mode"] = "continuation_settling" if quiet < 2 else "full_quietness"
         if code or not check.get("plan_ok"):
             return dict(check, rotated=False), 2
         feedback = {}
@@ -126,10 +166,21 @@ def point_still(api, args):
             return fail("episode_over", **extra)
         if code or not feedback.get("plan_ok"):
             return fail(feedback.get("plan_fail_reason") or "rotation_failed", **extra)
+        # Rotation cannot establish initialization; only preserve a valid
+        # initialization record after successful settling and motion.
+        if continuation and saved is not None:
+            _completed_transfers[api.arm("left")] = saved
+        succeeded = True
         return dict(plan_ok=True, plan_fail_reason=None, **extra), 0
     except Exception as exc:
         # Even partial motion or a backend exception must be reported as failure.
         return fail("point_still_error", detail=str(exc))
+    finally:
+        if consumed and not succeeded:
+            try:
+                _completed_transfers.pop(api.arm("left"), None)
+            except Exception:
+                pass
 
 
 def run(api, command, args):

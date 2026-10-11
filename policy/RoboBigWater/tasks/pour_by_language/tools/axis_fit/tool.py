@@ -128,6 +128,80 @@ def locate(observation, args, fitter=fit, model_name="vertical_circular_surface"
     return result
 
 
+def taper_evidence(points, source):
+    """Thin coaxial rings can expose taper rejected by the cylinder fitter."""
+    rings = []
+    for offset in (-.01, 0., .01):
+        local = points[np.abs(points[:, 2] - source[2] - offset) <= .002]
+        if len(local) < 20:
+            return None
+        try:
+            centre, radius = circle(local[:, :2])
+        except ValueError:
+            return None
+        residual = np.abs(np.linalg.norm(local[:, :2] - centre, axis=1) - radius)
+        angles = np.sort(np.arctan2(local[:, 1]-centre[1], local[:, 0]-centre[0]))
+        coverage = 2*np.pi - np.max(np.diff(np.r_[angles, angles[0]+2*np.pi]))
+        if (not .008 <= radius <= .06 or np.linalg.norm(centre-source[:2]) > .006
+                or np.quantile(residual, .9) > .0015 or coverage < math.radians(70)):
+            return None
+        rings.append(dict(z=float(source[2]+offset), radius_m=float(radius),
+                          centre_xy=centre.tolist()))
+    radii = [r['radius_m'] for r in rings]
+    if radii[0]-radii[2] > .006 and all(a-b > .001 for a, b in zip(radii, radii[1:])):
+        return dict(checked=True, supported=False, reason='observed_tapered_grasp',
+                    rings=rings, radius_drop_m=radii[0]-radii[2])
+    return None
+
+
+def sector_taper_evidence(points, source, candidates):
+    """Compare the same visible azimuths without extrapolating shoulder circles.
+
+    Facets and changing radii can invalidate circle centres at thin sections.
+    Anchor the supplied axis with two agreeing lower cylinder fits instead.
+    Missing sectors or inconsistent radial evidence remain unknown.
+    """
+    if len(candidates) < 2:
+        return None
+    broad = max(candidates, key=lambda c: c['radius_m'])
+    anchors = [c for c in candidates
+               if abs(c['radius_m'] - broad['radius_m']) <= .003]
+    if len(anchors) < 2:
+        return None
+    centres = np.array([c['centre_xy'] for c in anchors])
+    if np.max(np.linalg.norm(centres - centres.mean(axis=0), axis=1)) > .003:
+        return None
+    relative = points[:, :2] - centres.mean(axis=0)
+    angles = np.arctan2(relative[:, 1], relative[:, 0])
+    sectors = np.floor((angles + np.pi) / (np.pi / 12)).astype(int) % 24
+    radii = np.linalg.norm(relative, axis=1)
+    profiles = []
+    for offset in (-.01, 0., .01):
+        local = np.abs(points[:, 2] - source[2] - offset) <= .003
+        profile = {}
+        for sector in range(24):
+            values = radii[local & (sectors == sector)]
+            if (len(values) >= 3 and np.ptp(values) <= .006
+                    and .008 <= np.median(values) <= .06):
+                profile[sector] = float(np.median(values))
+        profiles.append(profile)
+    common = sorted(set(profiles[0]) & set(profiles[1]) & set(profiles[2]))
+    # Six populated 15-degree sectors cover at least 75 degrees between centres.
+    if len(common) < 6:
+        return None
+    matched = np.array([[profile[s] for s in common] for profile in profiles])
+    drops = matched[:-1] - matched[1:]
+    consistent = np.all(drops > .001, axis=0) & (matched[0]-matched[2] > .006)
+    if np.mean(consistent) < .8:
+        return None
+    return dict(checked=True, supported=False, reason='observed_tapered_grasp',
+                method='matched_angular_sectors', axis_xy=centres.mean(axis=0).tolist(),
+                lower_anchor_count=len(anchors), sector_ids=common,
+                section_z=[float(source[2]+offset) for offset in (-.01, 0., .01)],
+                sector_radii_m=matched.tolist(),
+                radius_drop_m=float(np.median(matched[0]-matched[2])))
+
+
 def support_profile(points, source, tip):
     """Compare observed coaxial sections; absence of evidence is not a rejection."""
     source = np.asarray(source, dtype=float)
@@ -142,19 +216,22 @@ def support_profile(points, source, tip):
         except ValueError:
             return None
     current = section(source[2])
-    if current is None:
-        return dict(checked=False, reason='requested section lacks a reliable circular fit')
+    taper = taper_evidence(local, source) if current is None else None
     candidates = []
     for distance in np.arange(.03, min(.18, .30 - tip) + 1e-9, .015):
         candidate = section(source[2] - distance)
         if candidate is not None:
             candidates.append(candidate)
+    if current is None and taper is None:
+        taper = sector_taper_evidence(local, source, candidates)
+        if taper is None:
+            return dict(checked=False, reason='requested section lacks a reliable circular fit')
     if not candidates:
-        return dict(checked=False, reason='no reliable lower section')
+        return taper or dict(checked=False, reason='no reliable lower section')
     broad = max(candidates, key=lambda c: c['radius_m'])
-    narrow = broad['radius_m'] > 1.5 * current['radius_m']
-    result = dict(checked=True, supported=not narrow,
-                  requested_radius_m=current['radius_m'], lower_radius_m=broad['radius_m'])
+    narrow = taper is not None or broad['radius_m'] > 1.5 * current['radius_m']
+    result = taper or dict(checked=True, supported=not narrow,
+                          requested_radius_m=current['radius_m'], lower_radius_m=broad['radius_m'])
     if narrow:
         z = sum(broad['observed_z_range']) / 2
         result['suggested_geometry'] = dict(x=broad['centre_xy'][0], y=broad['centre_xy'][1],
